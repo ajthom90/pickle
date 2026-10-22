@@ -1,5 +1,6 @@
 """Runs the checks on a schedule, records results, and tracks incidents."""
 import asyncio
+import ipaddress
 import logging
 import random
 import time
@@ -21,7 +22,10 @@ class Monitor:
         self.checks = list(cfg["checks"])
         self.state = {}       # check_id -> {"last": row, "streak": n, "streak_start": ts, "incident": id}
         self.wan_ip = None
-        self.hops = {"external": None, "inside": None}
+        # external: last traceroute hop before his WAN, seen from the internet
+        # inside: first ISP hop on a traceroute from his router
+        # gateway: his WAN's default gateway (the ISP's router), from UniFi or that traceroute
+        self.hops = {"external": None, "inside": None, "gateway": None, "gateway_source": None}
         self.hop_traces = {}
         self.last_trace = 0
         self.started = time.time()
@@ -85,13 +89,9 @@ class Monitor:
         if target == "{isp_hop_external}":
             fixed = self.cfg["target"].get("isp_hop_external", "auto")
             return self.hops["external"] if fixed == "auto" else fixed
-        if target == "{isp_hop_inside}":
-            fixed = self.cfg["wireguard"].get("isp_hop_inside", "auto")
-            if fixed != "auto":
-                return fixed
-            # UniFi knows its WAN next hop exactly; fall back to the traceroute's guess.
-            port = (self.unifi.snapshot.get("wan_port") if self.unifi else None) or {}
-            return port.get("gateway") or self.hops["inside"]
+        if target == "{isp_gateway}":
+            fixed = self.cfg["target"].get("isp_gateway", "auto")
+            return self.hops["gateway"] if fixed == "auto" else fixed
         return target
 
     async def _hop_discovery(self):
@@ -105,8 +105,21 @@ class Monitor:
             await asyncio.sleep(120 if missing else HOP_REDISCOVER)
 
     def effective_hops(self):
+        fixed = self.cfg["target"].get("isp_gateway", "auto") != "auto"
         return {"external": self.resolve_target("{isp_hop_external}"),
-                "inside": self.resolve_target("{isp_hop_inside}")}
+                "gateway": self.resolve_target("{isp_gateway}"),
+                "gateway_source": "config" if fixed else self.hops["gateway_source"]}
+
+    def note_gateway(self, ip, source):
+        """Record his WAN's default gateway. UniFi's answer beats a traceroute guess."""
+        if not ip or (source == "traceroute" and self.hops["gateway_source"] == "UniFi"):
+            return
+        if self.hops["gateway"] != ip and self.hops["gateway"]:
+            self.event("hops", "isp_gateway_change",
+                       f"His WAN default gateway changed {self.hops['gateway']} -> {ip} ({source})")
+        if self.hops["gateway"] != ip or self.hops["gateway_source"] != source:
+            self.hops["gateway"], self.hops["gateway_source"] = ip, source
+            self.db.set_kv("hops", self.hops)
 
     async def discover_hops(self):
         """Find the ISP routers adjacent to his connection, from outside and inside."""
@@ -131,10 +144,12 @@ class Monitor:
             hops, raw = await probes.trace(target, source=self.tunnel.source)
             self.hop_traces["inside"] = {"ts": time.time(), "hops": hops}
             gw = self.cfg["wireguard"]["gateway_lan_ip"]
-            # Hop 1 is his gateway; the first responder after it is the ISP.
+            # Hop 1 is his gateway; the first responder after it is the ISP's router,
+            # normally the same address as his WAN's default gateway.
             after = [h for h in hops if h["hop"] >= 2 and h["host"] not in ("???", gw)]
             if hops and after:
                 self._set_hop("inside", after[0]["host"])
+                self.note_gateway(after[0]["host"], "traceroute")
 
     def _set_hop(self, which, ip):
         if self.hops[which] != ip:
@@ -165,6 +180,10 @@ class Monitor:
         if target is None:
             self._note_waiting(check)
             return
+        if not vpn and check.get("target") == "{isp_gateway}" and _not_routable(target):
+            self.state.setdefault(check["id"], {})["waiting"] = (
+                f"{target} is a private/CGNAT address, so it can't be reached from the internet")
+            return
         source = self.tunnel.source if vpn else None
         t = check["type"]
         if t == "ping":
@@ -184,6 +203,7 @@ class Monitor:
             if not self.unifi:
                 return
             res = await self.unifi.poll()
+            self.note_gateway(self.unifi.snapshot.get("isp_gateway"), "UniFi")
         else:
             raise ValueError(f"unknown check type {t}")
         self.record(check, ts, target, *res)
@@ -233,6 +253,13 @@ class Monitor:
         while True:
             await asyncio.sleep(3600)
             self.db.purge(self.cfg["retention_days"])
+
+
+def _not_routable(ip):
+    try:
+        return not ipaddress.ip_address(ip).is_global
+    except ValueError:
+        return False
 
 
 def _summarize(hops):

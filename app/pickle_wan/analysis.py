@@ -7,6 +7,7 @@ MERGE_GAP = 60      # seconds; incidents closer than this are one outage
 EVENT_PAD = 300     # seconds; reboots/IP changes this close to a window count toward it
 ALERT_PAD = 90      # seconds; same for UniFi alarms and events
 FAILING = 0.5       # a role "failed" in a window if >= this share of its results failed
+BASELINE = 3600     # seconds before a window used to spot checks that were already broken
 
 VERDICTS = {
     "isp": "ISP network",
@@ -40,18 +41,26 @@ def outages(db, checks_by_id, since, until):
     return [classify(db, checks_by_id, w) for w in windows]
 
 
+# Roles where *every* check must fail to count (one public host being down shouldn't make
+# the monitor's connection, or his whole internet, look down). For the rest, the
+# worst-failing check speaks for the role: e.g. either ISP router going dark is evidence.
+ALL_MUST_FAIL = {"control", "internet"}
+
+
 def role_stats(db, checks_by_id, start, end):
     rows = db.q("SELECT check_id, COUNT(*) n, SUM(ok = 0) bad FROM results "
                 "WHERE ts >= ? AND ts <= ? GROUP BY check_id", (start, end))
-    stats = {}
+    # A check that was already mostly failing beforehand (e.g. a router that never answers
+    # ping) says nothing about this window, so leave it out.
+    baseline = {r["check_id"]: (r["bad"] or 0) / r["n"] for r in db.q(
+        "SELECT check_id, COUNT(*) n, SUM(ok = 0) bad FROM results "
+        "WHERE ts >= ? AND ts < ? GROUP BY check_id", (start - BASELINE, start)) if r["n"]}
+    rates = {}
     for r in rows:
         check = checks_by_id.get(r["check_id"])
-        if not check:
-            continue
-        s = stats.setdefault(check["role"], {"n": 0, "bad": 0})
-        s["n"] += r["n"]
-        s["bad"] += r["bad"] or 0
-    return {role: s["bad"] / s["n"] for role, s in stats.items() if s["n"]}
+        if check and r["n"] and baseline.get(r["check_id"], 0) < FAILING:
+            rates.setdefault(check["role"], []).append((r["bad"] or 0) / r["n"])
+    return {role: (min(v) if role in ALL_MUST_FAIL else max(v)) for role, v in rates.items()}
 
 
 def classify(db, checks_by_id, w):
@@ -80,9 +89,10 @@ def classify(db, checks_by_id, w):
         code, why = "router", ("The gateway rebooted during this window (uptime reset). "
                                "That points at the router, its power, or a firmware update.")
     elif failed("wan") and failed("isp_hop"):
-        code, why = "isp", ("His WAN IP and the ISP's own router just upstream of it were both "
-                            "unreachable from the internet. The fault is inside the ISP network, "
-                            "before traffic ever reaches his router.")
+        code, why = "isp", ("His WAN IP and the ISP's own router just upstream of it (his WAN's "
+                            "default gateway or the last hop before him) were both unreachable "
+                            "from the internet. The fault is inside the ISP network, before "
+                            "traffic ever reaches his router.")
     elif failed("wan"):
         code = "last_mile"
         why = ("His WAN IP stopped answering while the ISP's upstream router stayed reachable"

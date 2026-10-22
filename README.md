@@ -48,7 +48,19 @@ ICMP, so an uncorroborated alert is worth knowing about.
 3. **UniFi API key.** UniFi Network → Settings → Control Plane → Integrations → create an API key.
    A local (non-SSO) admin username/password also works (`unifi.username` / `unifi.password`).
 
-### 2. On your Docker server
+### 2. Run it
+
+The image is published to GHCR as `ghcr.io/ajthom90/pickle` (amd64 and arm64) by
+`.github/workflows/docker.yml` on every push to `main`. Pushing a `v1.2.3` tag also
+publishes `1.2.3` and `1.2` tags. If the repository is private, the package is too.
+Either make the package public (GitHub → your profile → Packages → pickle → Package
+settings) or `docker login ghcr.io` on the host with a token that has `read:packages`.
+
+**TrueNAS SCALE:** use [`deploy/truenas-compose.yaml`](deploy/truenas-compose.yaml):
+Apps → Discover Apps → ⋮ → *Install via YAML*. Create the config and data folders
+first, and put `config.yaml` and `wg0.conf` in the config folder.
+
+**Any other Docker host:**
 
 ```sh
 git clone <this repo> pickle && cd pickle
@@ -58,24 +70,43 @@ echo "UNIFI_API_KEY=xxxxxxxx" > .env
 docker compose up -d --build
 ```
 
-Open `http://<docker-server>:8080`. Set `PICKLE_USERNAME` / `PICKLE_PASSWORD` in
-`docker-compose.yml` if the port is reachable by anyone but you.
+Open `http://<docker-server>:8080`. Set `PICKLE_USERNAME` / `PICKLE_PASSWORD` if the port
+is reachable by anyone but you.
 
 `target.wan_host` can be a DDNS hostname. Pickle re-resolves it every minute, logs IP
 changes, and re-points the tunnel when it goes stale.
 
-**Requirements:** the container needs `NET_ADMIN` (already in the compose file) to create
-its own `wg0` and routing rules inside its network namespace. Your host's routing is not
-touched. If the host kernel has no WireGuard module (some NAS boxes), uncomment the
-`/dev/net/tun` device in `docker-compose.yml` and it falls back to `wireguard-go`.
+**Two connections, one container:** checks marked *external* use the host's normal
+internet connection. Checks marked *vpn* bind to the tunnel address, and a routing rule
+inside the container sends only that traffic through `wg0`. The container needs
+`NET_ADMIN` for this, but it all happens in the container's own network namespace, so
+the host's routing is untouched. If the host kernel has no WireGuard module (some NAS
+boxes), pass `/dev/net/tun` into the container and it falls back to `wireguard-go`.
 
-## Finding the ISP's routers
+## Finding the ISP's router
 
-The ISP router "just upstream of his WAN" is found by traceroute. From outside, it's the last
-hop before his WAN IP. From inside, UniFi reports the WAN next hop directly, with a traceroute
-as fallback. Traceroutes rerun hourly, and again whenever his WAN starts failing (the
-"during failure" trace in the event log shows where the path died). If the ISP filters
-traceroutes, set `target.isp_hop_external` / `wireguard.isp_hop_inside` by hand.
+UniFi doesn't show it prominently, but his gateway has a default gateway of its own: the
+ISP's router his connection terminates on (for fiber usually a BNG, or the OLT's routed
+interface). Pickle finds it in this order:
+
+1. **The UniFi API**: the gateway's WAN next hop (`wan1.gateway` on the device).
+2. **A traceroute through the tunnel**: the first hop after his router.
+3. **`target.isp_gateway`** in the config, which overrides both.
+
+It's remembered across restarts, a change is logged as an event, and it's pinged
+**from the internet and through the tunnel**. That's the key comparison:
+
+- His WAN dark, ISP gateway answering from outside → the ISP's router is fine and his
+  connection to it isn't (fiber, ONT, session) — or his router, if it rebooted.
+- His WAN dark *and* ISP gateway dark from outside → the ISP's network.
+
+If the gateway address is private (CGNAT, `100.64.0.0/10`, or RFC 1918), it can only be
+pinged from inside. The outside check then says so instead of reporting failures. In that
+case the external comparison falls back to the **last hop before him** on a traceroute
+from the monitor, which is tracked separately (`target.isp_hop_external`).
+
+Checks that were already failing in the hour before an outage (an ISP router that never
+answers ping, say) are left out of that outage's verdict.
 
 ## Exports
 

@@ -76,8 +76,8 @@ function renderHeader(st) {
   const wanPing = st.checks.find((c) => c.id === "ext_wan_ping");
   if (wanPing && !wanPing.ever_ok && wanPing.last && Date.now() / 1000 - st.started > 300)
     banners.push(`<b>His gateway has never answered a ping from the internet.</b> Allow ICMP echo on the WAN in UniFi (Settings → Security / firewall), or add a TCP port under <code>target.tcp_ports</code>. Until then, WAN checks can't tell up from down.`);
-  if (!st.hops.external && Date.now() / 1000 - st.started > 120)
-    banners.push(`The ISP router upstream of him hasn't been found yet (traceroute pending or blocked). You can set <code>target.isp_hop_external</code> manually.`);
+  if (!st.hops.gateway && !st.hops.external && Date.now() / 1000 - st.started > 180)
+    banners.push(`The ISP's router hasn't been found yet. It comes from the UniFi API or a traceroute through the tunnel; you can also set <code>target.isp_gateway</code> manually.`);
   if (st.unifi_enabled && !st.unifi && st.tunnel && st.tunnel.up)
     banners.push(`UniFi API hasn't answered yet. Check the URL and API key; raw responses are at <a href="/api/unifi/raw">/api/unifi/raw</a>.`);
   $("#banners").innerHTML = banners.map((b) => `<div class="banner">${b}</div>`).join("");
@@ -162,12 +162,14 @@ function renderGateway(st) {
 }
 
 function renderPath(st) {
-  const parts = [`<dl class="kv"><dt>ISP hop (outside)</dt><dd>${esc(st.hops.external || "not found yet")}</dd>
-    <dt>ISP hop (inside)</dt><dd>${esc(st.hops.inside || (st.tunnel ? "not found yet" : "no tunnel"))}</dd></dl>`];
+  const src = { UniFi: "reported by UniFi", traceroute: "from a traceroute through his router", config: "set in config" };
+  const parts = [`<dl class="kv">
+    <dt>ISP gateway</dt><dd>${esc(st.hops.gateway || "not found yet")}${st.hops.gateway ? ` <span class="muted">· his WAN's default gateway, ${esc(src[st.hops.gateway_source] || "")}</span>` : ""}</dd>
+    <dt>Last hop before him</dt><dd>${esc(st.hops.external || "not found yet")} <span class="muted">· traceroute from the monitor</span></dd></dl>`];
   for (const [which, label] of [["external", "Monitor → his WAN"], ["inside", "His router → internet"]]) {
     const tr = st.hop_traces?.[which];
     if (!tr || !tr.hops.length) continue;
-    const mark = which === "external" ? st.hops.external : st.hops.inside;
+    const mark = which === "external" ? st.hops.external : st.hops.gateway;
     parts.push(`<h3 class="muted" style="font-size:12px;margin:12px 0 4px">${label} · ${fmtTime(tr.ts)}</h3>
       <div class="table-wrap"><table class="hops"><tbody>${tr.hops.map((h) =>
         `<tr class="${h.host === mark || h.host === st.wan_ip ? "mark" : ""}"><td>${h.hop}</td><td>${esc(h.host)}</td><td class="num">${h.loss}% loss</td><td class="num">${h.avg_ms == null ? "" : h.avg_ms + " ms"}</td></tr>`).join("")}</tbody></table></div>`);

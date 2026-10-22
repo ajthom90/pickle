@@ -88,6 +88,9 @@ class UniFi:
                 if gss.get("uptime"):
                     snap["uptime"] = int(gss["uptime"])
                 snap["unifi_wan_monitor"] = sub.get("uptime_stats")
+                gws = sub.get("gateways") or []
+                if gws and isinstance(gws, list) and isinstance(gws[0], str):
+                    snap["isp_gateway"] = gws[0]
             elif sub.get("subsystem") == "www":
                 snap["www_status"] = sub.get("status")
                 snap["www_drops"] = sub.get("drops")
@@ -105,6 +108,9 @@ class UniFi:
                                     ("up", "ip", "gateway", "type", "speed", "full_duplex", "name")
                                     if k in wan1}
                 snap["wan_ip"] = snap.get("wan_ip") or wan1.get("ip")
+                gw = wan1.get("gateway") or wan1.get("gateway_ip")
+                if gw:
+                    snap["isp_gateway"] = gw
                 break
         if "uptime" not in snap and self.snapshot.get("integration_uptime"):
             snap["uptime"] = self.snapshot["integration_uptime"]

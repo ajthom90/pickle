@@ -8,11 +8,12 @@ CONFIG_PATH = os.environ.get("PICKLE_CONFIG", "/config/config.yaml")
 
 # Roles drive the outage verdicts in analysis.py:
 #   wan       - his WAN IP, probed from the internet
-#   isp_hop   - the ISP router just upstream of his WAN, probed from the internet
+#   isp_hop   - ISP routers just upstream of his WAN (his WAN's default gateway, and the
+#               last traceroute hop before him), probed from the internet
 #   control   - well-known hosts probed from the monitor's own connection
 #   tunnel    - WireGuard handshake freshness
 #   gateway   - his gateway's LAN IP, through the tunnel
-#   isp_hop_inside - the ISP's first hop as seen from inside his network
+#   isp_hop_inside - his WAN's default gateway (the ISP's router), probed through the tunnel
 #   internet  - internet hosts reached through his connection
 #   dns       - name resolution through his connection
 #   gateway_api - the UniFi API itself
@@ -23,13 +24,13 @@ DEFAULTS = {
     "interval_seconds": 15,
     "fail_threshold": 2,
     "retention_days": 90,
-    "target": {"wan_host": "", "tcp_ports": [], "isp_hop_external": "auto"},
+    "target": {"wan_host": "", "tcp_ports": [], "isp_hop_external": "auto",
+               "isp_gateway": "auto"},
     "control_targets": ["1.1.1.1", "8.8.8.8"],
     "wireguard": {
         "enabled": True,
         "config": "/config/wg0.conf",
         "gateway_lan_ip": "192.168.1.1",
-        "isp_hop_inside": "auto",
         "internet_targets": ["1.1.1.1", "8.8.8.8"],
         "dns_servers": ["1.1.1.1"],
         "dns_query": "www.google.com",
@@ -112,8 +113,10 @@ def default_checks(cfg):
     checks = [
         {"id": "ext_wan_ping", "name": "His WAN IP (ping)", "via": "external",
          "type": "ping", "target": "{wan}", "role": "wan"},
-        {"id": "ext_isp_hop_ping", "name": "ISP router upstream of him (ping)", "via": "external",
-         "type": "ping", "target": "{isp_hop_external}", "role": "isp_hop"},
+        {"id": "ext_isp_gateway_ping", "name": "ISP gateway (his WAN's default gateway)",
+         "via": "external", "type": "ping", "target": "{isp_gateway}", "role": "isp_hop"},
+        {"id": "ext_isp_hop_ping", "name": "ISP router before him (traceroute hop)",
+         "via": "external", "type": "ping", "target": "{isp_hop_external}", "role": "isp_hop"},
     ]
     for port in t.get("tcp_ports") or []:
         checks.append({"id": f"ext_wan_tcp_{port}", "name": f"His WAN IP (TCP {port})",
@@ -130,8 +133,8 @@ def default_checks(cfg):
              "type": "tunnel", "target": "wg0", "role": "tunnel"},
             {"id": "vpn_gateway_ping", "name": "His gateway LAN IP (ping)", "via": "vpn",
              "type": "ping", "target": wg["gateway_lan_ip"], "role": "gateway"},
-            {"id": "vpn_isp_hop_ping", "name": "ISP first hop from inside (ping)", "via": "vpn",
-             "type": "ping", "target": "{isp_hop_inside}", "role": "isp_hop_inside"},
+            {"id": "vpn_isp_gateway_ping", "name": "ISP gateway (his WAN's default gateway)",
+             "via": "vpn", "type": "ping", "target": "{isp_gateway}", "role": "isp_hop_inside"},
         ]
         for host in wg["internet_targets"]:
             checks.append({"id": f"vpn_inet_{_slug(host)}", "name": f"{host} via his connection (ping)",

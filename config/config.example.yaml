@@ -6,8 +6,12 @@ target:
   # Optional TCP ports on his WAN to probe in addition to ping (only if something
   # answers there; the WireGuard port is UDP and silent, so it can't be probed).
   tcp_ports: []
-  # The ISP router immediately upstream of his connection, as seen from the
-  # internet. "auto" finds it with a traceroute every hour.
+  # His WAN's default gateway: the ISP's router his connection plugs into. It's
+  # pinged from the internet and through the tunnel. "auto" takes it from the
+  # UniFi API, or from a traceroute through his router if UniFi isn't set up.
+  isp_gateway: auto
+  # The last router before his WAN on a traceroute from the monitor. Often a
+  # different interface of the same ISP router, sometimes the next one up.
   isp_hop_external: auto
 
 # Hosts pinged from the monitor's own connection. If these fail too, an outage
@@ -22,7 +26,6 @@ wireguard:
   enabled: true
   config: /config/wg0.conf     # the client config exported from his UniFi WireGuard server
   gateway_lan_ip: 192.168.1.1  # his Dream Router's LAN IP
-  isp_hop_inside: auto         # the ISP's first hop as seen from his router
   internet_targets: [1.1.1.1, 8.8.8.8]
   dns_servers: [1.1.1.1]
   dns_query: www.google.com
