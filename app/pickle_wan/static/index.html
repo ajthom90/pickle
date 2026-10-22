@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pickle WAN Monitor</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="title">
+    <h1>pickle</h1>
+    <div class="sub" id="wan"></div>
+  </div>
+  <div id="overall" class="overall"></div>
+</header>
+
+<div class="toolbar">
+  <div class="seg" id="range" role="group" aria-label="Time range">
+    <button data-h="1">1h</button><button data-h="6">6h</button><button data-h="24" class="on">24h</button><button data-h="168">7d</button><button data-h="720">30d</button>
+  </div>
+  <div class="exports">
+    <span class="muted">Export this range:</span>
+    <a id="x-results-csv">Results CSV</a>
+    <a id="x-results-json">Results JSON</a>
+    <a id="x-outages-csv">Outages CSV</a>
+    <a id="x-events-csv">Events CSV</a>
+    <a id="x-report" target="_blank">Report for ISP</a>
+  </div>
+</div>
+
+<div id="banners"></div>
+
+<main>
+  <section class="card">
+    <div class="card-head">
+      <h2>Checks</h2>
+      <div class="legend" aria-label="Legend">
+        <span><i class="sw good"></i>All succeeded</span>
+        <span><i class="sw warning"></i>Some failures or packet loss</span>
+        <span><i class="sw critical"></i>Mostly failing</span>
+        <span><i class="sw none"></i>No data</span>
+      </div>
+    </div>
+    <div id="groups"></div>
+    <div class="axis" id="axis"></div>
+  </section>
+
+  <section class="card">
+    <h2>Outages <span class="muted" id="outage-count"></span></h2>
+    <p class="hint">Each window where his WAN, his internet access, or DNS failed, with a verdict based on which layers failed together.</p>
+    <div class="table-wrap"><table id="outages"><thead><tr><th>Start</th><th>Duration</th><th>Verdict</th><th>Why</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <div class="two">
+    <section class="card">
+      <h2>His gateway (UniFi)</h2>
+      <div id="gateway"></div>
+    </section>
+    <section class="card">
+      <h2>Network path</h2>
+      <div id="path"></div>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>UniFi WAN alerts vs. external evidence</h2>
+    <p class="hint">If UniFi says the internet dropped but his WAN kept answering from outside, the alert didn't reflect a real outage.</p>
+    <div class="table-wrap"><table id="alerts"><thead><tr><th>Time</th><th>UniFi alert</th><th>Confirmed from outside?</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section class="card">
+    <h2>Event log</h2>
+    <div class="table-wrap"><table id="events"><thead><tr><th>Time</th><th>Source</th><th>Event</th></tr></thead><tbody></tbody></table></div>
+  </section>
+</main>
+
+<div id="tip" class="tip" role="tooltip" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

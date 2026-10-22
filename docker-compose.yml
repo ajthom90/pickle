@@ -1,0 +1,31 @@
+services:
+  pickle:
+    build: .
+    container_name: pickle
+    restart: unless-stopped
+    # NET_ADMIN lets the container create its own wg0 interface and routing
+    # rules. They live only in the container's network namespace; the host's
+    # routing is untouched. Don't use network_mode: host.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    # Only needed if the Docker host's kernel lacks WireGuard (e.g. some NAS
+    # boxes); pickle then falls back to the userspace wireguard-go.
+    # devices:
+    #   - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.conf.all.rp_filter=2
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/config:ro
+      - pickle-data:/data
+    environment:
+      - TZ=America/Chicago
+      - UNIFI_API_KEY=${UNIFI_API_KEY:-}
+      # Uncomment to require a login for the web UI:
+      # - PICKLE_USERNAME=admin
+      # - PICKLE_PASSWORD=change-me
+
+volumes:
+  pickle-data:

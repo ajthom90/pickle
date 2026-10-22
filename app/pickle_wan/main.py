@@ -1,0 +1,358 @@
+"""Web app: JSON API, CSV/JSON exports, a printable report, and the dashboard."""
+import asyncio
+import base64
+import csv
+import html
+import io
+import json
+import logging
+import os
+import secrets
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+from . import analysis, config
+from .db import DB
+from .monitor import Monitor
+
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+CFG = config.load()
+db = DB()
+monitor = Monitor(CFG, db)
+STATIC = os.path.join(os.path.dirname(__file__), "static")
+USER = os.environ.get("PICKLE_USERNAME")
+PASSWORD = os.environ.get("PICKLE_PASSWORD")
+
+
+@asynccontextmanager
+async def lifespan(app):
+    task = asyncio.create_task(monitor.start())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="pickle", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def basic_auth(request: Request, call_next):
+    if PASSWORD:
+        header = request.headers.get("authorization", "")
+        ok = False
+        if header.lower().startswith("basic "):
+            try:
+                user, _, pw = base64.b64decode(header[6:]).decode().partition(":")
+                ok = (secrets.compare_digest(user, USER or user)
+                      and secrets.compare_digest(pw, PASSWORD))
+            except ValueError:
+                ok = False
+        if not ok:
+            return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="pickle"'})
+    return await call_next(request)
+
+
+def _range(hours, since, until):
+    until = until or time.time()
+    since = since or until - hours * 3600
+    return since, until
+
+
+def _iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds") if ts else ""
+
+
+def _check_meta(c):
+    return {k: c.get(k) for k in ("id", "name", "via", "type", "role", "interval")} | {
+        "target": monitor.resolve_target(c.get("target")) or c.get("target")}
+
+
+# ---- API ---------------------------------------------------------------------
+
+@app.get("/api/status")
+def status():
+    now = time.time()
+    since = now - 86400
+    agg = {r["check_id"]: r for r in db.q(
+        "SELECT check_id, COUNT(*) n, SUM(ok) good, AVG(CASE WHEN ok THEN latency_ms END) lat "
+        "FROM results WHERE ts >= ? GROUP BY check_id", (since,))}
+    ever_ok = {r["check_id"] for r in db.q("SELECT DISTINCT check_id FROM results WHERE ok = 1")}
+    checks = []
+    for c in monitor.checks:
+        st = monitor.state.get(c["id"], {})
+        a = agg.get(c["id"])
+        checks.append(_check_meta(c) | {
+            "last": st.get("last"),
+            "waiting": st.get("waiting"),
+            "in_incident": bool(st.get("incident")),
+            "uptime_24h": (a["good"] / a["n"]) if a and a["n"] else None,
+            "avg_latency_24h": a["lat"] if a else None,
+            "ever_ok": c["id"] in ever_ok,
+        })
+    tunnel = None
+    if monitor.tunnel:
+        t = monitor.tunnel
+        rx, tx = t.transfer() if t.up else (None, None)
+        tunnel = {"up": t.up, "error": t.error, "source": t.source,
+                  "endpoint": f"{t.endpoint_host}:{t.endpoint_port}" if t.endpoint_host else None,
+                  "handshake_age": t.handshake_age() if t.up else None, "rx": rx, "tx": tx}
+    open_outages = [o for o in analysis.outages(db, monitor.by_id, now - 3600, now) if o["ongoing"]]
+    return {
+        "now": now, "started": monitor.started,
+        "wan_host": CFG["target"]["wan_host"], "wan_ip": monitor.wan_ip,
+        "hops": monitor.effective_hops(), "hop_traces": monitor.hop_traces,
+        "checks": checks, "tunnel": tunnel,
+        "unifi": monitor.unifi.snapshot if monitor.unifi else None,
+        "unifi_enabled": CFG["unifi"]["enabled"],
+        "ongoing_outage": open_outages[-1] if open_outages else None,
+    }
+
+
+@app.get("/api/timeline")
+def timeline(hours: float = 24, since: float | None = None, until: float | None = None,
+             buckets: int = Query(120, ge=10, le=1000)):
+    since, until = _range(hours, since, until)
+    width = (until - since) / buckets
+    rows = db.q("SELECT check_id, CAST((ts - ?) / ? AS INTEGER) b, COUNT(*) n, SUM(ok = 0) bad, "
+                "AVG(CASE WHEN ok THEN latency_ms END) lat, AVG(loss) loss "
+                "FROM results WHERE ts >= ? AND ts < ? GROUP BY check_id, b",
+                (since, width, since, until))
+    out = {c["id"]: [None] * buckets for c in monitor.checks}
+    for r in rows:
+        if r["check_id"] in out and 0 <= r["b"] < buckets:
+            out[r["check_id"]][r["b"]] = {"n": r["n"], "bad": r["bad"], "lat": r["lat"],
+                                          "loss": r["loss"]}
+    return {"since": since, "until": until, "width": width, "buckets": buckets, "series": out}
+
+
+@app.get("/api/outages")
+def outages(hours: float = 24, since: float | None = None, until: float | None = None):
+    since, until = _range(hours, since, until)
+    return list(reversed(analysis.outages(db, monitor.by_id, since, until)))
+
+
+@app.get("/api/unifi_alerts")
+def unifi_alerts(hours: float = 24, since: float | None = None, until: float | None = None):
+    since, until = _range(hours, since, until)
+    return analysis.unifi_alerts(db, monitor.by_id, since, until)
+
+
+@app.get("/api/events")
+def events(hours: float = 24, since: float | None = None, until: float | None = None):
+    since, until = _range(hours, since, until)
+    return [dict(r) | {"data": json.loads(r["data"]) if r["data"] else None}
+            for r in db.q("SELECT ts, source, kind, message, data FROM events "
+                          "WHERE ts >= ? AND ts <= ? ORDER BY ts DESC LIMIT 500", (since, until))]
+
+
+@app.get("/api/unifi/raw")
+def unifi_raw():
+    if not monitor.unifi:
+        return {"enabled": False}
+    return {"snapshot": monitor.unifi.snapshot, "unsupported": sorted(monitor.unifi.unsupported),
+            "raw": monitor.unifi.raw}
+
+
+@app.post("/api/rediscover")
+async def rediscover():
+    await monitor.discover_hops()
+    return {"hops": monitor.hops}
+
+
+# ---- exports -----------------------------------------------------------------
+
+RESULT_COLS = ["timestamp_utc", "unix_ts", "check_id", "check_name", "via", "role", "target",
+               "result", "latency_ms", "packet_loss_pct", "detail"]
+
+
+def _result_rows(since, until, check):
+    sql = "SELECT * FROM results WHERE ts >= ? AND ts <= ?"
+    args = [since, until]
+    if check:
+        sql += " AND check_id = ?"
+        args.append(check)
+    for r in db.conn.execute(sql + " ORDER BY ts", args):
+        c = monitor.by_id.get(r["check_id"], {})
+        yield {"timestamp_utc": _iso(r["ts"]), "unix_ts": round(r["ts"], 3),
+               "check_id": r["check_id"], "check_name": c.get("name", ""),
+               "via": c.get("via", ""), "role": c.get("role", ""), "target": r["target"],
+               "result": "success" if r["ok"] else "failure",
+               "latency_ms": round(r["latency_ms"], 2) if r["latency_ms"] is not None else None,
+               "packet_loss_pct": round(r["loss"] * 100, 1) if r["loss"] is not None else None,
+               "detail": r["detail"]}
+
+
+def _csv_stream(cols, rows, filename):
+    def gen():
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, cols)
+        w.writeheader()
+        for i, row in enumerate(rows):
+            w.writerow(row)
+            if i % 500 == 0:
+                yield buf.getvalue()
+                buf.seek(0)
+                buf.truncate()
+        yield buf.getvalue()
+    return StreamingResponse(gen(), media_type="text/csv",
+                             headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+def _stamp(since, until):
+    f = "%Y%m%d-%H%M"
+    return (datetime.fromtimestamp(since, timezone.utc).strftime(f) + "_"
+            + datetime.fromtimestamp(until, timezone.utc).strftime(f))
+
+
+@app.get("/export/results.csv")
+def export_results_csv(hours: float = 24, since: float | None = None,
+                       until: float | None = None, check: str | None = None):
+    since, until = _range(hours, since, until)
+    return _csv_stream(RESULT_COLS, _result_rows(since, until, check),
+                       f"pickle-results_{_stamp(since, until)}.csv")
+
+
+@app.get("/export/results.json")
+def export_results_json(hours: float = 24, since: float | None = None,
+                        until: float | None = None, check: str | None = None):
+    since, until = _range(hours, since, until)
+
+    def gen():
+        yield json.dumps({"exported_at": _iso(time.time()), "wan_host": CFG["target"]["wan_host"],
+                          "since": _iso(since), "until": _iso(until),
+                          "checks": [_check_meta(c) for c in monitor.checks]})[:-1]
+        yield ', "results": ['
+        for i, row in enumerate(_result_rows(since, until, check)):
+            yield ("," if i else "") + json.dumps(row)
+        yield "]}"
+    return StreamingResponse(gen(), media_type="application/json", headers={
+        "Content-Disposition": f'attachment; filename="pickle-results_{_stamp(since, until)}.json"'})
+
+
+OUTAGE_COLS = ["start_utc", "end_utc", "duration_s", "verdict", "explanation", "failed_checks",
+               "role_failure_rates", "unifi_events"]
+
+
+@app.get("/export/outages.csv")
+def export_outages_csv(hours: float = 24 * 7, since: float | None = None,
+                       until: float | None = None):
+    since, until = _range(hours, since, until)
+    rows = ({"start_utc": _iso(o["start"]), "end_utc": _iso(o["end"]) or "ongoing",
+             "duration_s": round(o["duration"]), "verdict": o["verdict_label"],
+             "explanation": o["explanation"], "failed_checks": " ".join(o["checks"]),
+             "role_failure_rates": json.dumps(o["role_failure"]),
+             "unifi_events": " | ".join(f"{_iso(e['ts'])} {e['message']}" for e in o["unifi_events"])}
+            for o in analysis.outages(db, monitor.by_id, since, until))
+    return _csv_stream(OUTAGE_COLS, rows, f"pickle-outages_{_stamp(since, until)}.csv")
+
+
+@app.get("/export/events.csv")
+def export_events_csv(hours: float = 24 * 7, since: float | None = None,
+                      until: float | None = None):
+    since, until = _range(hours, since, until)
+    rows = ({"timestamp_utc": _iso(r["ts"]), "source": r["source"], "kind": r["kind"],
+             "message": r["message"]}
+            for r in db.q("SELECT * FROM events WHERE ts >= ? AND ts <= ? ORDER BY ts",
+                          (since, until)))
+    return _csv_stream(["timestamp_utc", "source", "kind", "message"], rows,
+                       f"pickle-events_{_stamp(since, until)}.csv")
+
+
+# ---- printable report ------------------------------------------------------------
+
+@app.get("/report", response_class=HTMLResponse)
+def report(hours: float = 24 * 7, since: float | None = None, until: float | None = None):
+    since, until = _range(hours, since, until)
+    e = html.escape
+    outs = analysis.outages(db, monitor.by_id, since, until)
+    alerts = analysis.unifi_alerts(db, monitor.by_id, since, until)
+    agg = {r["check_id"]: r for r in db.q(
+        "SELECT check_id, COUNT(*) n, SUM(ok) good, AVG(CASE WHEN ok THEN latency_ms END) lat, "
+        "AVG(loss) loss FROM results WHERE ts >= ? AND ts <= ? GROUP BY check_id", (since, until))}
+
+    counts = {}
+    for o in outs:
+        counts[o["verdict_label"]] = counts.get(o["verdict_label"], 0) + 1
+
+    check_rows = "".join(
+        f"<tr><td>{e(c['name'])}</td><td>{_path_label(c)}</td>"
+        f"<td>{e(str(monitor.resolve_target(c.get('target')) or ''))}</td>"
+        f"<td class=num>{a['n']}</td><td class=num>{a['good'] / a['n'] * 100:.3f}%</td>"
+        f"<td class=num>{'' if a['lat'] is None else f'{a['lat']:.1f}'}</td></tr>"
+        for c in monitor.checks if (a := agg.get(c["id"])) and a["n"])
+    outage_rows = "".join(
+        f"<tr><td>{_ts(o['start'])}</td><td>{_ts(o['end']) or 'ongoing'}</td>"
+        f"<td class=num>{_fmt_dur(o['duration'])}</td><td><b>{e(o['verdict_label'])}</b></td>"
+        f"<td>{e(o['explanation'])}<br><small>Failed: {e(', '.join(o['checks']))}</small>"
+        + "".join(f"<br><small>UniFi {_ts(ev['ts'])}: {e(ev['message'])}</small>"
+                  for ev in o["unifi_events"]) + "</td></tr>"
+        for o in outs) or "<tr><td colspan=5>No outages recorded in this period.</td></tr>"
+    alert_rows = "".join(
+        f"<tr><td>{_ts(a['ts'])}</td><td>{e(a['message'])}</td><td>"
+        + {True: "Yes, external checks failed", False: "No, his WAN answered from the internet",
+           None: "No data"}[a["corroborated"]] + "</td></tr>"
+        for a in alerts) or "<tr><td colspan=3>No UniFi WAN alerts in this period.</td></tr>"
+    summary = ", ".join(f"{v} × {e(k)}" for k, v in sorted(counts.items(), key=lambda x: -x[1]))
+
+    return f"""<!doctype html><html><head><meta charset=utf-8>
+<title>Connectivity report</title>
+<style>
+body{{font:14px/1.45 system-ui,sans-serif;max-width:1000px;margin:24px auto;padding:0 16px;color:#0b0b0b;background:#fff}}
+h1{{font-size:22px;margin:0 0 4px}} h2{{font-size:16px;margin:28px 0 8px}}
+table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #d6d5d0;padding:6px 8px;text-align:left;vertical-align:top}}
+th{{background:#f3f2ee}} .num{{text-align:right;font-variant-numeric:tabular-nums}} small{{color:#52514e}}
+.meta{{color:#52514e}} @media print{{a{{display:none}}}}
+</style></head><body>
+<h1>Internet connectivity report: {e(CFG['target']['wan_host'])}</h1>
+<div class=meta>Period {_ts(since)} to {_ts(until)} (UTC). Generated {_ts(time.time())}. <a href="javascript:print()">Print / save as PDF</a></div>
+<h2>Summary</h2>
+<p>{len(outs)} outage window(s){': ' + summary if summary else ''}.</p>
+<h2>Method</h2>
+<p>A monitor outside his network probes his WAN IP and the ISP's own router immediately upstream of it,
+plus control hosts to prove the monitor's own connection was healthy. Through a WireGuard tunnel to his gateway,
+it also probes internet hosts and DNS <i>from his connection</i>, and reads the gateway's uptime, WAN port state and event log.
+Every result is timestamped; a failure that hits his WAN IP <i>and</i> the ISP's upstream router at the same time, while
+the gateway's uptime is unbroken, places the fault in the ISP network.</p>
+<h2>Outages</h2>
+<table><tr><th>Start (UTC)</th><th>End (UTC)</th><th>Duration</th><th>Verdict</th><th>Evidence</th></tr>{outage_rows}</table>
+<h2>UniFi WAN alerts vs. external evidence</h2>
+<table><tr><th>Time (UTC)</th><th>UniFi alert</th><th>Confirmed from outside?</th></tr>{alert_rows}</table>
+<h2>Check availability</h2>
+<table><tr><th>Check</th><th>Path</th><th>Target</th><th class=num>Samples</th><th class=num>Success</th><th class=num>Avg ms</th></tr>{check_rows}</table>
+<p class=meta>Raw per-check results for this period: <a href="/export/results.csv?since={since}&until={until}">CSV</a> · <a href="/export/results.json?since={since}&until={until}">JSON</a></p>
+</body></html>"""
+
+
+def _path_label(c):
+    if c["role"] == "control":
+        return "Monitor's own connection"
+    return "Internet → him" if c["via"] == "external" else "Through his router"
+
+
+def _ts(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if ts else ""
+
+
+def _fmt_dur(s):
+    s = int(s)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    return f"{s // 3600}h {s % 3600 // 60}m"
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    with open(os.path.join(STATIC, "index.html")) as f:
+        return f.read()
+
+
+app.mount("/static", StaticFiles(directory=STATIC), name="static")

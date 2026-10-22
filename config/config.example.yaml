@@ -1,0 +1,52 @@
+# Copy to config/config.yaml and edit. Only target.wan_host is required.
+
+target:
+  # His public IP or a DDNS hostname that points at it.
+  wan_host: friend.example.com
+  # Optional TCP ports on his WAN to probe in addition to ping (only if something
+  # answers there; the WireGuard port is UDP and silent, so it can't be probed).
+  tcp_ports: []
+  # The ISP router immediately upstream of his connection, as seen from the
+  # internet. "auto" finds it with a traceroute every hour.
+  isp_hop_external: auto
+
+# Hosts pinged from the monitor's own connection. If these fail too, an outage
+# window is marked inconclusive rather than blamed on anyone.
+control_targets: [1.1.1.1, 8.8.8.8]
+
+interval_seconds: 15   # how often each check runs
+fail_threshold: 2      # consecutive failures before an incident opens
+retention_days: 90
+
+wireguard:
+  enabled: true
+  config: /config/wg0.conf     # the client config exported from his UniFi WireGuard server
+  gateway_lan_ip: 192.168.1.1  # his Dream Router's LAN IP
+  isp_hop_inside: auto         # the ISP's first hop as seen from his router
+  internet_targets: [1.1.1.1, 8.8.8.8]
+  dns_servers: [1.1.1.1]
+  dns_query: www.google.com
+  gateway_dns: true           # also test DNS through his gateway's resolver
+  http_url: https://www.google.com/generate_204
+
+unifi:
+  enabled: true
+  url: https://192.168.1.1     # reached through the tunnel
+  api_key: ${UNIFI_API_KEY}    # UniFi Network → Settings → Control Plane → Integrations
+  # Or a local (non-SSO) admin account instead of an API key:
+  username: ""
+  password: ""
+  site: default
+  verify_tls: false            # the gateway uses a self-signed certificate
+  interval_seconds: 60
+
+# Extra checks (same shape as the built-in ones). via: external | vpn,
+# type: ping | tcp | dns | http, role: see app/pickle_wan/config.py.
+extra_checks: []
+#  - id: vpn_nas
+#    name: His NAS
+#    via: vpn
+#    type: tcp
+#    target: 192.168.1.20
+#    port: 443
+#    role: gateway

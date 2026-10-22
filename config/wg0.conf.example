@@ -1,0 +1,13 @@
+# Export a client config from UniFi Network → Settings → VPN → VPN Server
+# (WireGuard) → Add client, and save it as config/wg0.conf.
+# pickle ignores DNS/Table/PostUp lines, and forces AllowedIPs to 0.0.0.0/0 on
+# its side because it routes only probe traffic through the tunnel.
+[Interface]
+PrivateKey = <client private key>
+Address = 192.168.3.2/32
+
+[Peer]
+PublicKey = <server public key>
+AllowedIPs = 0.0.0.0/0
+Endpoint = friend.example.com:51820
+PersistentKeepalive = 25
