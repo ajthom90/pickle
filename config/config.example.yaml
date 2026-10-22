@@ -43,6 +43,25 @@ unifi:
   verify_tls: false            # the gateway uses a self-signed certificate
   interval_seconds: 60
 
+# Push notifications through ntfy (ntfy.sh or your own server). You get one message
+# when an outage starts and one when it ends, with the verdict.
+ntfy:
+  enabled: false
+  server: https://ntfy.sh      # or your self-hosted server, e.g. https://ntfy.example.com
+  topic: pickle-change-me      # on ntfy.sh, anyone who knows the topic can read it: make it unguessable
+  # Only for servers that require login. Use an access token (ntfy token add <user>),
+  # or a username and password; the token wins if both are set. These can also come
+  # from the NTFY_TOKEN / NTFY_USERNAME / NTFY_PASSWORD environment variables.
+  token: ""
+  username: ""
+  password: ""
+  verify_tls: true             # false for a self-hosted server with a self-signed certificate
+  min_duration_seconds: 60     # ignore outages shorter than this
+  priority_down: high          # min | low | default | high | max
+  priority_up: default
+  ignore_verdicts: []          # e.g. [tunnel, monitor] to skip VPN-only and monitor-side outages
+  click_url: ""                # opened when you tap the notification, e.g. http://docker-host:8080
+
 # Extra checks (same shape as the built-in ones). via: external | vpn,
 # type: ping | tcp | dns | http, role: see app/pickle_wan/config.py.
 extra_checks: []

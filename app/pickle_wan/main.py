@@ -111,6 +111,7 @@ def status():
         "checks": checks, "tunnel": tunnel,
         "unifi": monitor.unifi.snapshot if monitor.unifi else None,
         "unifi_enabled": CFG["unifi"]["enabled"],
+        "ntfy_enabled": CFG["ntfy"]["enabled"],
         "ongoing_outage": open_outages[-1] if open_outages else None,
     }
 
@@ -164,6 +165,17 @@ def unifi_raw():
 async def rediscover():
     await monitor.discover_hops()
     return {"hops": monitor.hops}
+
+
+@app.post("/api/ntfy/test")
+async def ntfy_test():
+    """Send a test notification, to check the server, topic, and credentials."""
+    if not monitor.ntfy:
+        return {"enabled": False, "ok": False, "detail": "ntfy is not enabled in config.yaml"}
+    ok, detail = await monitor.ntfy.send(
+        f"pickle test ({CFG['target']['wan_host']})",
+        "Notifications from pickle are working.", "default", ["test_tube"])
+    return {"enabled": True, "ok": ok, "detail": detail}
 
 
 # ---- exports -----------------------------------------------------------------

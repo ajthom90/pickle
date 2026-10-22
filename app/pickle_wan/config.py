@@ -4,6 +4,8 @@ import re
 
 import yaml
 
+from .analysis import VERDICTS
+
 CONFIG_PATH = os.environ.get("PICKLE_CONFIG", "/config/config.yaml")
 
 # Roles drive the outage verdicts in analysis.py:
@@ -47,9 +49,33 @@ DEFAULTS = {
         "verify_tls": False,
         "interval_seconds": 60,
     },
+    "ntfy": {
+        "enabled": False,
+        "server": "https://ntfy.sh",
+        "topic": "",
+        # Authentication, for servers that require it: an access token (tk_...), or a
+        # username and password. The token wins if both are set.
+        "token": "",
+        "username": "",
+        "password": "",
+        "verify_tls": True,
+        "min_duration_seconds": 60,
+        "priority_down": "high",
+        "priority_up": "default",
+        "ignore_verdicts": [],
+        "click_url": "",
+    },
     "checks": None,
     "extra_checks": [],
 }
+
+# Secrets can come from the environment instead of config.yaml.
+ENV_FALLBACKS = [
+    ("UNIFI_API_KEY", "unifi", "api_key"),
+    ("NTFY_TOKEN", "ntfy", "token"),
+    ("NTFY_USERNAME", "ntfy", "username"),
+    ("NTFY_PASSWORD", "ntfy", "password"),
+]
 
 _ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -80,10 +106,20 @@ def load(path=CONFIG_PATH):
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
     cfg = _merge(DEFAULTS, _expand(raw))
-    if os.environ.get("UNIFI_API_KEY") and not cfg["unifi"]["api_key"]:
-        cfg["unifi"]["api_key"] = os.environ["UNIFI_API_KEY"]
+    for var, section, key in ENV_FALLBACKS:
+        if os.environ.get(var) and not cfg[section][key]:
+            cfg[section][key] = os.environ[var]
     if not cfg["target"]["wan_host"]:
         raise SystemExit("config: target.wan_host is required (his WAN IP or DDNS name)")
+    n = cfg["ntfy"]
+    if n["enabled"]:
+        if not n["topic"]:
+            raise SystemExit("config: ntfy.topic is required when ntfy is enabled")
+        if not n["server"].startswith(("http://", "https://")):
+            raise SystemExit("config: ntfy.server must start with http:// or https://")
+        unknown = set(n["ignore_verdicts"] or []) - set(VERDICTS)
+        if unknown:
+            raise SystemExit(f"config: ntfy.ignore_verdicts has unknown verdicts {sorted(unknown)}")
     cfg["checks"] = build_checks(cfg)
     return cfg
 

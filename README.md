@@ -122,6 +122,31 @@ timestamps):
 `/api/unifi/raw` shows exactly what the UniFi API returned, which helps if a field shows up
 empty on his firmware version.
 
+## Notifications (ntfy)
+
+Pickle can push outage alerts through [ntfy](https://ntfy.sh), either ntfy.sh or a
+self-hosted server. Turn it on in the `ntfy:` section of `config.yaml`. Each outage
+sends two messages:
+
+- **Started**, once it has lasted `min_duration_seconds` (default 60), naming the
+  failing checks and an early verdict.
+- **Resolved**, a minute after it ends (so a flapping line doesn't send a pair per flap),
+  with the duration and the final verdict and explanation.
+
+Shorter outages send nothing. What's been sent is stored in the database, so a restart
+doesn't repeat it. `ignore_verdicts` skips outages you don't care about, e.g.
+`[tunnel, monitor]` for VPN-only blips and ones caused by your own connection.
+
+**Servers that require login:** set `token` to an access token (`ntfy token add <user>`
+on the server), or `username` and `password`. The token is used if both are set. To keep
+secrets out of `config.yaml`, use the `NTFY_TOKEN`, `NTFY_USERNAME` and `NTFY_PASSWORD`
+environment variables instead. The user needs write access to the topic.
+
+To check the setup, use **Send test notification** on the dashboard (next to *Re-run
+path discovery*), or `curl -X POST http://<docker-server>:8080/api/ntfy/test`. A failure
+shows the server's answer, e.g. `HTTP 401` for bad credentials or `HTTP 403` when the user
+can't write to the topic.
+
 ## Configuration
 
 See `config/config.example.yaml`. Everything except `target.wan_host` has a default. Defaults:

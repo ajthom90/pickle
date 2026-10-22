@@ -174,11 +174,18 @@ function renderPath(st) {
       <div class="table-wrap"><table class="hops"><tbody>${tr.hops.map((h) =>
         `<tr class="${h.host === mark || h.host === st.wan_ip ? "mark" : ""}"><td>${h.hop}</td><td>${esc(h.host)}</td><td class="num">${h.loss}% loss</td><td class="num">${h.avg_ms == null ? "" : h.avg_ms + " ms"}</td></tr>`).join("")}</tbody></table></div>`);
   }
-  parts.push(`<p><a id="rediscover">Re-run path discovery</a></p>`);
+  parts.push(`<p><a id="rediscover">Re-run path discovery</a>${st.ntfy_enabled ? ` · <a id="ntfytest">Send test notification</a> <span id="ntfyresult" class="muted"></span>` : ""}</p>`);
   $("#path").innerHTML = parts.join("");
   $("#rediscover").onclick = async () => {
     $("#rediscover").textContent = "Running traceroutes…";
     try { await fetch("/api/rediscover", { method: "POST" }); } finally { refresh(); }
+  };
+  if (st.ntfy_enabled) $("#ntfytest").onclick = async () => {
+    $("#ntfyresult").textContent = "sending…";
+    try {
+      const r = await (await fetch("/api/ntfy/test", { method: "POST" })).json();
+      $("#ntfyresult").textContent = r.ok ? "sent" : `failed: ${r.detail}`;
+    } catch (e) { $("#ntfyresult").textContent = `failed: ${e}`; }
   };
 }
 

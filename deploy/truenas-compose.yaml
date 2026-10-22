@@ -27,6 +27,10 @@ services:
     environment:
       TZ: America/Chicago
       UNIFI_API_KEY: "paste-your-unifi-api-key-here"
+      # ntfy credentials, if your ntfy server requires login (or set them in config.yaml):
+      # NTFY_TOKEN: "tk_..."
+      # NTFY_USERNAME: pickle
+      # NTFY_PASSWORD: change-me
       # Uncomment to require a login for the web UI:
       # PICKLE_USERNAME: admin
       # PICKLE_PASSWORD: change-me

@@ -6,6 +6,7 @@ import random
 import time
 
 from . import probes
+from .notify import Ntfy
 from .unifi import UniFi
 from .wg import STALE_HANDSHAKE, Tunnel
 
@@ -31,6 +32,7 @@ class Monitor:
         self.started = time.time()
         self.tunnel = None
         self.unifi = None
+        self.ntfy = Ntfy(cfg["ntfy"], cfg["target"]["wan_host"]) if cfg["ntfy"]["enabled"] else None
 
         wg = cfg["wireguard"]
         if wg["enabled"]:
@@ -60,6 +62,8 @@ class Monitor:
             elif self.cfg["unifi"]["enabled"]:
                 self.unifi = UniFi(self.cfg["unifi"], self.db, self.tunnel.source)
         tasks = [self._wan_resolver(), self._hop_discovery(), self._housekeeping()]
+        if self.ntfy:
+            tasks.append(self.ntfy.run(self))
         if self.tunnel and self.tunnel.up:
             tasks.append(self.tunnel.watchdog(self.event))
         await self._resolve_wan()
