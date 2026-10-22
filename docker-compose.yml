@@ -22,7 +22,7 @@ services:
       - pickle-data:/data
     environment:
       - TZ=America/Chicago
-      - UNIFI_API_KEY=${UNIFI_API_KEY:-}
+      - UNIFI_API_KEY=paste-your-unifi-api-key-here
       # Uncomment to require a login for the web UI:
       # - PICKLE_USERNAME=admin
       # - PICKLE_PASSWORD=change-me

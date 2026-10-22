@@ -66,7 +66,7 @@ first, and put `config.yaml` and `wg0.conf` in the config folder.
 git clone <this repo> pickle && cd pickle
 cp config/config.example.yaml config/config.yaml   # set target.wan_host, gateway_lan_ip
 cp ~/Downloads/<client>.conf config/wg0.conf
-echo "UNIFI_API_KEY=xxxxxxxx" > .env
+# paste your UniFi API key into UNIFI_API_KEY in docker-compose.yml
 docker compose up -d --build
 ```
 
