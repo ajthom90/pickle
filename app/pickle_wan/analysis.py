@@ -1,4 +1,5 @@
 """Turns raw check results into outages with a verdict on where the fault was."""
+import json
 import time
 
 # Incidents on checks with these roles start an outage window.
@@ -8,6 +9,9 @@ EVENT_PAD = 300     # seconds; reboots/IP changes this close to a window count t
 ALERT_PAD = 90      # seconds; same for UniFi alarms and events
 FAILING = 0.5       # a role "failed" in a window if >= this share of its results failed
 BASELINE = 3600     # seconds before a window used to spot checks that were already broken
+PORT_LEAD = 90      # seconds; a WAN port drop seen within this of the start is "at the start"
+RECOVER_PAD = 120   # seconds; an outage ending this close to the port coming back ended with it
+UNIFI_POLL = 60     # fallback detection window for WAN port events from before it was recorded
 
 VERDICTS = {
     "isp": "ISP network",
@@ -66,15 +70,16 @@ def role_stats(db, checks_by_id, start, end):
 def classify(db, checks_by_id, w):
     start, end = w["start"], w["end"] if w["end"] is not None else time.time()
     fail = role_stats(db, checks_by_id, start, end)
-    events = [e for e in db.q("SELECT ts, kind, message FROM events WHERE source = 'unifi' "
+    events = [e for e in db.q("SELECT ts, kind, message, data FROM events WHERE source = 'unifi' "
                               "AND ts >= ? AND ts <= ? ORDER BY ts",
                               (start - EVENT_PAD, end + EVENT_PAD))
               # Reboots and IP changes are detected late, so they get a wide margin; alerts don't.
               if e["kind"] in ("reboot", "wan_ip_change", "wan_port")
               or start - ALERT_PAD <= e["ts"] <= end + ALERT_PAD]
+    events = [dict(e) | {"data": json.loads(e["data"]) if e["data"] else None} for e in events]
     reboots = [e for e in events if e["kind"] == "reboot"]
     wan_ip_changed = any(e["kind"] == "wan_ip_change" for e in events)
-    port_down = any(e["kind"] == "wan_port" and "DOWN" in e["message"] for e in events)
+    port_note = wan_port_note(events, start, end, w["end"] is None, wan_ip_changed)
 
     def failed(role):
         return fail.get(role) is not None and fail[role] >= FAILING
@@ -103,9 +108,9 @@ def classify(db, checks_by_id, w):
         else:
             why += ". The fault is between the ISP and his router's WAN port (fiber, ONT, ISP "
             why += "session), or the router itself; without UniFi data a reboot can't be ruled out."
-        if port_down:
-            why += " UniFi logged the WAN port going DOWN: the ONT dropped the link, which is ISP equipment."
-        if wan_ip_changed:
+        if port_note:
+            why += " " + port_note
+        elif wan_ip_changed:
             why += " His WAN IP changed afterward, consistent with the ISP resetting the session."
     elif failed("internet") and ok("gateway") and not failed("tunnel"):
         code, why = "upstream", ("His router was reachable from outside and over the VPN, but "
@@ -127,8 +132,61 @@ def classify(db, checks_by_id, w):
         "checks": sorted(w["checks"]),
         "verdict": code, "verdict_label": VERDICTS[code], "explanation": why,
         "role_failure": {k: round(v, 3) for k, v in fail.items()},
-        "unifi_events": [dict(e) for e in events],
+        "unifi_events": events,
     }
+
+
+def _into(ts, start):
+    """'3 min' into the outage, for explanations (server-side text has no reliable timezone)."""
+    m = max(0, round((ts - start) / 60))
+    return "the start" if m == 0 else f"{m} min in"
+
+
+def _port_window(e):
+    """When a WAN port change could have happened: between the last poll that saw the old
+    state and the poll that saw the new one."""
+    d = e.get("data") or {}
+    return (d.get("since") or e["ts"] - UNIFI_POLL), (d.get("seen") or e["ts"])
+
+
+def wan_port_note(events, start, end, ongoing, wan_ip_changed):
+    """Explain a WAN port DOWN by when it happened. Only a drop at the start of the outage
+    means the ONT dropped the link; a drop well into it came after traffic had already
+    stopped, which is what someone unplugging or power-cycling equipment looks like."""
+    downs = [e for e in events if e["kind"] == "wan_port" and "DOWN" in e["message"]]
+    if not downs:
+        return None
+    lo, hi = _port_window(downs[0])
+    ip_note = (" His WAN IP changed afterward, consistent with the ISP resetting the session."
+               if wan_ip_changed else "")
+    if hi <= start + PORT_LEAD:
+        return ("UniFi logged the WAN port going DOWN as the outage began: the ONT dropped the "
+                "link, which is ISP equipment." + ip_note)
+    if lo < start + PORT_LEAD:
+        return (f"UniFi logged the WAN port going DOWN, but pickle couldn't reach the gateway "
+                f"between {_into(lo, start)} and {_into(hi, start)}, so it can't tell whether "
+                f"the port dropped when the outage began (the ONT dropping the link) or later "
+                f"(someone unplugging or power-cycling equipment)." + ip_note)
+    note = (f"The WAN port went DOWN about {round((lo - start) / 60)} min into the outage, after "
+            f"traffic had already stopped, so it wasn't the cause; that's what someone unplugging "
+            f"or power-cycling the router or ONT looks like.")
+    ups = [e for e in events if e["kind"] == "wan_port" and "UP" in e["message"]
+           and _port_window(e)[0] >= lo]
+    if ups and not ongoing:
+        up_lo, up_hi = _port_window(ups[0])
+        if up_lo - RECOVER_PAD <= end <= up_hi + RECOVER_PAD:
+            note += (" The outage ended when the link came back up, so reconnecting cleared it: "
+                     "the line itself was working by then.")
+            if wan_ip_changed:
+                note += (" His WAN IP changed when it reconnected, so the ISP had dropped his "
+                         "session and his router hadn't noticed (its link never went down).")
+            else:
+                note += (" His WAN IP didn't change, so the ISP session never ended; a port that "
+                         "stopped passing traffic, on the ONT or his router, is more likely. "
+                         "Pulling the cable resets both ends, so this outage can't say which.")
+    else:
+        note += ip_note
+    return note
 
 
 def unifi_alerts(db, checks_by_id, since, until):

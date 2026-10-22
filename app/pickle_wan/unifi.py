@@ -159,11 +159,17 @@ class UniFi:
             self.db.set_kv("gw_wan_ip", snap["wan_ip"])
         port = snap.get("wan_port") or {}
         if "up" in port:
+            # Stored as {"up": bool, "ts": last poll that saw it}; older versions stored a bare bool.
             prev = self.db.get_kv("gw_wan_up")
-            if prev is not None and prev != port["up"]:
+            prev_up, prev_ts = (prev.get("up"), prev.get("ts")) if isinstance(prev, dict) else (prev, None)
+            if prev_up is not None and prev_up != port["up"]:
+                # Polling only sees the change, not when it happened: it happened somewhere
+                # between the last poll that saw the old state and this one. During an outage
+                # the gateway is usually unreachable, so that window can be long.
                 self.db.add_event("unifi", "wan_port",
-                                  "Gateway reports WAN port " + ("UP" if port["up"] else "DOWN"))
-            self.db.set_kv("gw_wan_up", port["up"])
+                                  "Gateway reports WAN port " + ("UP" if port["up"] else "DOWN"),
+                                  data={"up": port["up"], "since": prev_ts, "seen": now})
+            self.db.set_kv("gw_wan_up", {"up": port["up"], "ts": now})
 
     def _ingest(self, items, kind):
         for it in items:
