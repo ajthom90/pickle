@@ -2,9 +2,9 @@
 #
 # Before installing, create these datasets/folders (adjust the pool path) and put
 # two files in the config folder:
-#   /mnt/tank/apps/pickle/config/config.yaml   (from config/config.example.yaml)
-#   /mnt/tank/apps/pickle/config/wg0.conf      (WireGuard client config from his UniFi)
-#   /mnt/tank/apps/pickle/data/                (empty; the database lives here)
+#   /mnt/drive4/apps/pickle/config/config.yaml   (from config/config.example.yaml)
+#   /mnt/drive4/apps/pickle/config/wg0.conf      (WireGuard client config from his UniFi)
+#   /mnt/drive4/apps/pickle/data/                (empty; the database lives here)
 #
 # The container keeps two paths apart: "external" checks use TrueNAS's normal
 # internet connection, and only the "through his router" checks use the WireGuard
@@ -22,8 +22,8 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - /mnt/tank/apps/pickle/config:/config:ro
-      - /mnt/tank/apps/pickle/data:/data
+      - /mnt/drive4/apps/pickle/config:/config:ro
+      - /mnt/drive4/apps/pickle/data:/data
     environment:
       TZ: America/Chicago
       UNIFI_API_KEY: "paste-your-unifi-api-key-here"
