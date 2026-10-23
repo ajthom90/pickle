@@ -111,6 +111,8 @@ def status():
         "checks": checks, "tunnel": tunnel,
         "unifi": monitor.unifi.snapshot if monitor.unifi else None,
         "unifi_enabled": CFG["unifi"]["enabled"],
+        "ssh": monitor.routerlog.status if monitor.routerlog else (
+            {"state": "disabled"} if not CFG["ssh"]["enabled"] else {"state": "starting"}),
         "ntfy_enabled": CFG["ntfy"]["enabled"],
         "ongoing_outage": open_outages[-1] if open_outages else None,
     }
@@ -206,8 +208,10 @@ def unifi_alerts(hours: float = 24, since: float | None = None, until: float | N
 def events(hours: float = 24, since: float | None = None, until: float | None = None):
     since, until = _range(hours, since, until)
     return [dict(r) | {"data": json.loads(r["data"]) if r["data"] else None}
+            # Plain router log lines are many; they're shown with each outage instead.
             for r in db.q("SELECT ts, source, kind, message, data FROM events "
-                          "WHERE ts >= ? AND ts <= ? ORDER BY ts DESC LIMIT 500", (since, until))]
+                          "WHERE ts >= ? AND ts <= ? AND NOT (source = 'router_log' AND kind = 'log') "
+                          "ORDER BY ts DESC LIMIT 500", (since, until))]
 
 
 @app.get("/api/unifi/raw")
@@ -310,7 +314,8 @@ OUTAGE_COLS = ["start_utc", "end_utc", "duration_s", "verdict", "explanation", "
                "role_failure_rates", "unifi_events", "lease_obtained_utc", "lease_time_s",
                "lease_expires_utc", "lease_due_in_window", "lease_note", "after_recovery_utc",
                "after_recovery_wan_ip", "after_recovery_gateway", "after_recovery_wan_port",
-               "after_recovery_lease", "download_mbps_before",
+               "after_recovery_lease", "router_log_finding", "router_log_note", "router_log_lines",
+               "download_mbps_before",
                "upload_mbps_before", "cpu_pct_before", "mem_pct_before", "temp_c_before",
                "clients_before"]
 
@@ -336,6 +341,13 @@ def _lease_cols(o):
     }
 
 
+def _router_cols(o):
+    rl = o.get("router_log") or {}
+    return {"router_log_finding": rl.get("finding") or "",
+            "router_log_note": rl.get("note", ""),
+            "router_log_lines": " | ".join(x["message"] for x in rl.get("lines", [])[-40:])}
+
+
 def _load_cols(o):
     lb = o.get("load_before") or {}
     mbps = lambda v: round(v / 1e6, 2) if v is not None else None  # noqa: E731
@@ -357,7 +369,7 @@ def export_outages_csv(hours: float = 24 * 7, since: float | None = None,
              "failed_checks": " ".join(o["checks"]),
              "role_failure_rates": json.dumps(o["role_failure"]),
              "unifi_events": " | ".join(f"{_iso(e['ts'])} {e['message']}" for e in o["unifi_events"])}
-            | _lease_cols(o) | _load_cols(o)
+            | _lease_cols(o) | _router_cols(o) | _load_cols(o)
             for o in _outages(since, until))
     return _csv_stream(OUTAGE_COLS, rows, f"pickle-outages_{_stamp(since, until)}.csv")
 
@@ -428,6 +440,11 @@ def report(hours: float = 24 * 7, since: float | None = None, until: float | Non
            if o.get("lease") and o["lease"]["note"] not in o["explanation"] else "")
         + (f"<br><small>Right after recovery: {e(_recovery_text(o['recovery']))}</small>"
            if o.get("recovery") else "")
+        + (f"<br><small>Router log: {e(o['router_log']['note'])}</small>"
+           if o.get("router_log") and o["router_log"]["note"]
+           and o["router_log"]["note"] not in o["explanation"] else "")
+        + "".join(f"<br><small><code>{e(x['message'])}</code></small>"
+                  for x in (o.get("router_log") or {}).get("lines", [])[-30:])
         + (f"<br><small>Load in the 10 min before: {e(_load_text(o['load_before']))}</small>"
            if o.get("load_before") else "") + "</td></tr>"
         for o in outs) or "<tr><td colspan=5>No outages recorded in this period.</td></tr>"

@@ -3,3 +3,5 @@ uvicorn==0.54.0
 httpx==0.28.1
 dnspython==2.9.0
 pyyaml==6.0.3
+asyncssh==2.24.1
+tzdata==2026.5

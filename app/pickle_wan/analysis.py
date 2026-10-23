@@ -104,6 +104,8 @@ def classify(db, checks_by_id, w):
     port["unknown"] = bool(set_aside)
     lease = lease_context(db, start, end, ongoing)
     recovery = recovery_snapshot(db, start, end)
+    router_log = router_log_context(db, start, end, ongoing,
+                                    rebooted=any(e["kind"] == "reboot" for e in events))
 
     def failed(role):
         return fail.get(role) is not None and fail[role] >= FAILING
@@ -168,6 +170,8 @@ def classify(db, checks_by_id, w):
 
     if code in WAN_VERDICTS and lease.get("due"):
         why += " " + lease["note"]
+    if code in WAN_VERDICTS and router_log and router_log.get("finding"):
+        why += " " + router_log["note"]
     if set_aside:
         kinds = sorted({"the gateway reboot" if e["kind"] == "reboot" else "the WAN port changes"
                         for e in set_aside})
@@ -185,6 +189,7 @@ def classify(db, checks_by_id, w):
         "unifi_events": events,
         "lease": lease,
         "recovery": recovery,
+        "router_log": router_log,
         "note": user_note,
     }
 
@@ -314,11 +319,14 @@ def wan_port_note(port, start, wan_ip_changed):
 
 
 def _lease_rows(db, until):
-    rows = db.q("SELECT ts, data FROM events WHERE source = 'unifi' AND kind = 'dhcp_lease' "
-                "AND ts <= ? ORDER BY ts", (until,))
+    # Lease history from UniFi and from the router's own log (udhcpc "lease ... obtained").
+    rows = db.q("SELECT ts, data FROM events WHERE source IN ('unifi', 'router_log') "
+                "AND kind = 'dhcp_lease' AND ts <= ? ORDER BY ts", (until,))
     out = []
     for r in rows:
         d = json.loads(r["data"]) if r["data"] else {}
+        if d.get("clock_suspect"):
+            continue
         if d.get("obtained") or d.get("expires"):
             out.append(d | {"ts": r["ts"]})
     return out
@@ -372,6 +380,73 @@ def outage_note(db, start, end):
             "text": " / ".join(r["note"] for r in rows if r["note"]),
             "human_action": any(r["human_action"] for r in rows),
             "updated": max(r["updated"] for r in rows)}
+
+
+ROUTER_LEAD = 600   # seconds of router log shown before an outage
+ROUTER_REQUESTS = {"dhcp_renew", "dhcp_rebind", "dhcp_select", "dhcp_discover"}
+ROUTER_ANSWERS = {"dhcp_lease", "dhcp_ack"}
+
+
+def router_log_context(db, start, end, ongoing, rebooted=False):
+    """The router's own DHCP/WAN log lines around an outage (collected over SSH), and what
+    they say about the DHCP exchange. None if no router log has ever been collected."""
+    if not db.q("SELECT 1 FROM events WHERE source = 'router_log' LIMIT 1"):
+        return None
+    rows = [dict(r) | {"data": json.loads(r["data"]) if r["data"] else {}} for r in db.q(
+        "SELECT ts, kind, message, data FROM events WHERE source = 'router_log' "
+        "AND ts >= ? AND ts <= ? ORDER BY ts", (start - ROUTER_LEAD, end + UNIFI_POLL))]
+    lines = [r for r in rows if not r["data"].get("clock_suspect")]
+    # The log only proves an absence if it covers the outage: it reaches back to before the
+    # outage, something was logged after it, and no reboot (which can wipe or reset the log)
+    # happened inside it.
+    def trusted(rows_):
+        return any(not json.loads(a["data"] or "{}").get("clock_suspect") for a in rows_)
+    after = db.q("SELECT data FROM events WHERE source = 'router_log' AND ts > ? "
+                 "ORDER BY ts LIMIT 20", (end,))
+    before_start = db.q("SELECT data FROM events WHERE source = 'router_log' AND ts <= ? "
+                        "ORDER BY ts DESC LIMIT 20", (start,))
+    covered = not ongoing and not rebooted and trusted(after) and trusted(before_start)
+    ctx = {"lines": [{"ts": r["ts"], "kind": r["kind"], "message": r["message"]} for r in lines],
+           "suspect_lines": len(rows) - len(lines), "covered": covered,
+           "finding": None, "note": ""}
+    requests = [r for r in lines if r["kind"] in ROUTER_REQUESTS and r["ts"] <= end]
+    answers = [r for r in lines if r["kind"] in ROUTER_ANSWERS]
+    word = {"dhcp_renew": "renewal", "dhcp_rebind": "rebind", "dhcp_select": "request",
+            "dhcp_discover": "discover"}
+    unanswered = None
+    for r in requests:
+        nxt = next((a for a in answers if a["ts"] > r["ts"]), None)
+        if r["ts"] >= start - ROUTER_LEAD and (nxt is None or nxt["ts"] >= end - RECOVER_PAD):
+            unanswered = (r, nxt)
+            break
+    before = [a for a in answers if start - ROUTER_LEAD <= a["ts"] < start]
+    if unanswered:
+        r, nxt = unanswered
+        sent = f"His router sent a DHCP {word[r['kind']]} {_relative(r['ts'], start)}"
+        if nxt or covered:
+            ctx["finding"] = "no_reply"
+            ctx["note"] = (sent + " and got no reply until the outage ended"
+                           + (f" (answered {_relative(nxt['ts'], start)})" if nxt else "")
+                           + ". That points at the ISP's DHCP server.")
+        else:
+            ctx["finding"] = "no_reply_logged"
+            ctx["note"] = (sent + "; no reply was logged before the outage ended, but the router "
+                           "log doesn't clearly cover the whole outage (no later lines yet, or "
+                           "a reboot), so a missing reply can't be confirmed.")
+    elif before:
+        a = before[-1]
+        ctx["finding"] = "answered_then_stopped"
+        ctx["note"] = (f"His router's DHCP lease was renewed {_relative(a['ts'], start)}, so it "
+                       f"held a valid lease when traffic stopped. That points at his router or "
+                       f"the ISP's session, not the DHCP exchange.")
+    elif covered and not any(start <= r["ts"] <= end for r in requests + answers):
+        ctx["finding"] = "quiet"
+        ctx["note"] = ("The router logged no DHCP activity during the outage: it still "
+                       "considered its lease valid.")
+    elif not covered and not ongoing:
+        ctx["note"] = ("The router log doesn't cover this outage yet (no lines after it, or the "
+                       "router rebooted).")
+    return ctx
 
 
 def recovery_snapshot(db, start, end):

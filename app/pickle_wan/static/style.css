@@ -148,6 +148,11 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 .chart .dot { stroke: var(--surface); stroke-width: 2; }
 .key { display: inline-flex; align-items: center; gap: 5px; margin-left: 12px; color: var(--text-2); }
 .key i { width: 14px; height: 2px; border-radius: 1px; display: inline-block; }
+.rlog { margin-top: 4px; }
+.rlog summary { cursor: pointer; color: var(--accent); font-size: 12px; }
+.rlog pre { font-size: 11px; line-height: 1.4; max-height: 260px; overflow: auto; margin: 4px 0 0;
+  padding: 6px 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  white-space: pre-wrap; word-break: break-all; }
 .note { color: var(--text); }
 .note-edit { font-size: 12px; }
 .note-form { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; max-width: 560px; }

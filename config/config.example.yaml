@@ -74,6 +74,18 @@ ntfy:
   #   1. Photograph the ONT (Network Status light, ETH1 lights).
   #   2. ...
 
+# Optional: read the router's DHCP/WAN log over SSH (through the tunnel), so outages
+# show what the router's DHCP client did. Off by default; see "Router log over SSH" in
+# the README for the security tradeoff.
+ssh:
+  enabled: false
+  # host: 192.168.1.1          # default: wireguard.gateway_lan_ip
+  port: 22
+  username: root
+  password: ""                 # or set SSH_PASSWORD in the compose file
+  key_file: ""                 # or a private key, e.g. /config/router_ed25519
+  host_key: ""                 # empty = pin the router's key on first connect
+
 # Extra checks (same shape as the built-in ones). via: external | vpn,
 # type: ping | tcp | dns | http, role: see app/pickle_wan/config.py.
 extra_checks: []

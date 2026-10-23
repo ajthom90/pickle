@@ -208,6 +208,56 @@ path discovery*), or `curl -X POST http://<docker-server>:8080/api/ntfy/test`. A
 shows the server's answer, e.g. `HTTP 401` for bad credentials or `HTTP 403` when the user
 can't write to the topic.
 
+## Router log over SSH (optional)
+
+With `ssh.enabled`, pickle logs in to his router through the WireGuard tunnel every 5
+minutes, and right after the gateway is reachable again after an outage, and reads its
+DHCP/WAN log lines: `grep -iE "dhcp|udhcpc|wan" /var/log/messages`, or `logread` /
+`journalctl` if that file doesn't exist. Each line is stored once, at the log line's own
+time. Lines without a year or timezone are placed using the router's clock and timezone,
+read in the same session, so DST changes are handled. The first collection reads further
+back (up to 20,000 matching lines), so older outages can get router evidence too if the
+router still has those lines.
+
+udhcpc lines (renew sent, lease obtained with its lease time, discover, NAK, lease lost)
+and common dhclient lines become structured events. Lease lines feed the lease timing
+above. Each outage then lists the router's lines from 10 minutes before it to its end,
+and calls out:
+
+- **Renewal sent, no reply until the outage ended**: points at the ISP's DHCP server. It
+  only says this when the log demonstrably covers the outage: there are lines after it,
+  and no reboot inside it. Otherwise it says the reply can't be confirmed.
+- **Renewal answered, then traffic stopped**: the router held a valid lease, so it points
+  at the router or the ISP's session, not the DHCP exchange.
+- **No DHCP activity during the outage**: the router still considered its lease valid.
+
+Lines from a reset clock (after a power cut, before NTP syncs) show up out of order. They
+are stored but flagged, and kept out of outage analysis. The dashboard's gateway panel shows
+the SSH status (connected, auth failed, host key mismatch, unreachable), the router's clock
+offset from the monitor, and the pinned host key fingerprint.
+
+**Setup.** Turn on SSH for the console in UniFi (Settings → Control Plane → Console → SSH)
+and set a password. Then set `ssh.enabled: true` and either `SSH_PASSWORD` in the compose
+file or `ssh.key_file` pointing at a private key in the config folder, which is mounted
+read-only.
+
+**Host key.** On first connect pickle pins the router's SSH host key and shows its
+fingerprint. Compare it with the router's own (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`
+on the router). If the key ever changes, pickle refuses to connect *before* sending the
+password, and shows "host key mismatch". If the router was reset or replaced, put its new
+key in `ssh.host_key`.
+
+**Security tradeoff.** This gives the monitor root credentials for his router. Pickle only
+ever runs a fixed list of read-only commands (`COMMANDS` in `routerlog.py`); nothing is
+built from config or input. It uses only the configured password or key (no SSH agent,
+default keys or `~/.ssh/config`), and connects only through the tunnel. But anyone who
+gets into the monitor container, or can read its config folder or environment, gets root
+on his router. If that's a concern:
+
+- Use a key rather than a password, and keep the config folder readable only by the app.
+- Leave it off and collect the log by hand when needed.
+- Turn it off again once the ISP case is settled.
+
 ## Configuration
 
 See `config/config.example.yaml`. Everything except `target.wan_host` has a default. Defaults:

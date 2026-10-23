@@ -27,6 +27,10 @@ services:
     environment:
       TZ: America/Chicago
       UNIFI_API_KEY: "paste-your-unifi-api-key-here"
+      # Only if ssh.enabled in config.yaml (router log collection). For a key instead,
+      # put the private key file in the config folder and set ssh.key_file:
+      # /config/<file>; the folder is mounted read-only.
+      # SSH_PASSWORD: "router-ssh-password"
       # ntfy credentials, if your ntfy server requires login (or set them in config.yaml):
       # NTFY_TOKEN: "tk_..."
       # NTFY_USERNAME: pickle

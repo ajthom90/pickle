@@ -7,6 +7,7 @@ import time
 
 from . import probes
 from .notify import Ntfy
+from .routerlog import RouterLog
 from .unifi import UniFi
 from .wg import STALE_HANDSHAKE, Tunnel
 
@@ -14,6 +15,7 @@ log = logging.getLogger("pickle.monitor")
 
 HOP_REDISCOVER = 3600
 TRACE_COOLDOWN = 300
+RECOVERY_ROLES = {"gateway", "gateway_api", "tunnel", "wan"}
 
 
 class Monitor:
@@ -33,6 +35,7 @@ class Monitor:
         self.tunnel = None
         self.unifi = None
         self.ntfy = Ntfy(cfg["ntfy"], cfg["target"]["wan_host"]) if cfg["ntfy"]["enabled"] else None
+        self.routerlog = None
 
         wg = cfg["wireguard"]
         if wg["enabled"]:
@@ -62,6 +65,9 @@ class Monitor:
             elif self.cfg["unifi"]["enabled"]:
                 self.unifi = UniFi(self.cfg["unifi"], self.db, self.tunnel.source)
         tasks = [self._wan_resolver(), self._hop_discovery(), self._housekeeping()]
+        if self.cfg["ssh"]["enabled"]:
+            self.routerlog = RouterLog(self.cfg["ssh"], self.db, self.tunnel)
+            tasks.append(self.routerlog.run())
         if self.ntfy:
             tasks.append(self.ntfy.run(self))
         if self.tunnel and self.tunnel.up:
@@ -228,6 +234,9 @@ class Monitor:
             if st.get("incident"):
                 self.db.x("UPDATE incidents SET end = ? WHERE id = ?", (ts, st["incident"]))
                 st["incident"] = None
+                # The gateway is reachable again: read its log while the outage is fresh.
+                if self.routerlog and check["role"] in RECOVERY_ROLES:
+                    self.routerlog.kick()
             return
         if not st.get("streak"):
             st["streak_start"] = ts

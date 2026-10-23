@@ -53,6 +53,16 @@ DEFAULTS = {
         "wan_down_mbps": 0,
         "wan_up_mbps": 0,
     },
+    # Optional: read DHCP/WAN lines from the router's log over SSH, through the tunnel.
+    "ssh": {
+        "enabled": False,
+        "host": "",              # default: wireguard.gateway_lan_ip
+        "port": 22,
+        "username": "root",
+        "password": "",
+        "key_file": "",          # e.g. /config/router_ed25519 (the config folder is mounted read-only)
+        "host_key": "",          # pin a known key ("ssh-ed25519 AAAA..."); empty = pin on first connect
+    },
     "ntfy": {
         "enabled": False,
         "server": "https://ntfy.sh",
@@ -85,6 +95,7 @@ DEFAULTS = {
 ENV_FALLBACKS = [
     ("UNIFI_API_KEY", "unifi", "api_key"),
     ("NTFY_TOKEN", "ntfy", "token"),
+    ("SSH_PASSWORD", "ssh", "password"),
     ("NTFY_USERNAME", "ntfy", "username"),
     ("NTFY_PASSWORD", "ntfy", "password"),
 ]
@@ -123,6 +134,16 @@ def load(path=CONFIG_PATH):
             cfg[section][key] = os.environ[var]
     if not cfg["target"]["wan_host"]:
         raise SystemExit("config: target.wan_host is required (his WAN IP or DDNS name)")
+    sh = cfg["ssh"]
+    if sh["enabled"]:
+        if not cfg["wireguard"]["enabled"]:
+            raise SystemExit("config: ssh needs wireguard enabled (the router is reached through the tunnel)")
+        if not (sh["password"] or sh["key_file"]):
+            raise SystemExit("config: ssh.enabled needs ssh.password (or SSH_PASSWORD) or ssh.key_file")
+        if sh["key_file"] and not os.path.exists(sh["key_file"]):
+            raise SystemExit(f"config: ssh.key_file {sh['key_file']} doesn't exist")
+        sh["host"] = sh["host"] or cfg["wireguard"]["gateway_lan_ip"]
+        sh["port"] = int(sh["port"])
     n = cfg["ntfy"]
     if n["enabled"]:
         if not n["topic"]:

@@ -23,6 +23,8 @@ services:
     environment:
       - TZ=America/Chicago
       - UNIFI_API_KEY=paste-your-unifi-api-key-here
+      # Only if ssh.enabled in config.yaml:
+      # - SSH_PASSWORD=router-ssh-password
       # ntfy credentials, if your ntfy server requires login (or set them in config.yaml):
       # - NTFY_TOKEN=tk_...
       # - NTFY_USERNAME=pickle

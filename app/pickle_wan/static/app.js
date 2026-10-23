@@ -151,6 +151,7 @@ function drawOutages() {
         o.unifi_events.map((e) => `<br><span class="muted">UniFi ${fmtTime(e.ts)}: ${esc(e.message)}${e.human_action ? " (set aside: human action)" : ""}</span>`).join("")}${
         o.lease && !o.explanation.includes(o.lease.note) ? `<br><span class="muted">DHCP lease: ${esc(o.lease.note)}</span>` : ""}${
         o.recovery ? `<br><span class="muted">Right after recovery: ${esc(recoveryText(o.recovery))}</span>` : ""}${
+        routerLogHTML(o)}${
         o.load_before ? `<br><span class="muted">10 min before: ${esc(loadText(o.load_before))}</span>` : ""}${noteHTML(o)}</td>
     </tr>`).join("") || `<tr><td colspan="4" class="muted">No outages in this range.</td></tr>`;
 }
@@ -186,6 +187,33 @@ document.addEventListener("submit", async (ev) => {
 });
 
 const fmtMbps = (bps) => bps == null ? "–" : (bps / 1e6 >= 100 ? (bps / 1e6).toFixed(0) : (bps / 1e6).toFixed(1)) + " Mbps";
+
+function routerLogHTML(o) {
+  const rl = o.router_log;
+  if (!rl) return "";
+  let out = rl.note && !o.explanation.includes(rl.note) ? `<br><span class="muted">Router log: ${esc(rl.note)}</span>` : "";
+  if (rl.lines.length) {
+    out += `<details class="rlog"><summary>Router log, 10 min before to the end (${rl.lines.length} line${rl.lines.length === 1 ? "" : "s"})</summary><pre>${
+      rl.lines.slice(-60).map((l) => esc(l.message)).join("\n")}</pre></details>`;
+  }
+  return out;
+}
+
+const SSH_STATE = {
+  connected: ["good", "Connected"], auth_failed: ["critical", "Auth failed"],
+  host_key_mismatch: ["critical", "Host key mismatch"], unreachable: ["warning", "Unreachable"],
+  no_tunnel: ["warning", "Waiting for tunnel"], error: ["critical", "Error"], starting: ["none", "Starting"],
+};
+
+function sshRows(ssh) {
+  if (!ssh || ssh.state === "disabled") return [["Router SSH", `<span class="muted">off (ssh.enabled)</span>`]];
+  const [cls, label] = SSH_STATE[ssh.state] || ["none", ssh.state];
+  const rows = [["Router SSH", `${badge(cls, label)} <span class="muted">${esc(ssh.detail || "")}</span>`]];
+  if (ssh.last_ok) rows.push(["Router log read", `${fmtTime(ssh.last_ok)}${ssh.source ? " · " + esc(ssh.source) : ""}`]);
+  if (ssh.fingerprint) rows.push(["Pinned host key", `<code>${esc(ssh.fingerprint)}</code>`]);
+  if (ssh.clock_skew != null) rows.push(["Router clock", `${ssh.clock_skew >= 0 ? "+" : ""}${ssh.clock_skew}s vs monitor · ${esc(ssh.tz || "")}`]);
+  return rows;
+}
 
 function recoveryText(r) {
   const parts = [fmtTime(r.ts)];
@@ -354,10 +382,13 @@ function renderGateway(st) {
       }
     }
     rows.push(["Last poll", fmtTime(u.polled_at)]);
+    rows.push(...sshRows(st.ssh));
   } else if (st.unifi_enabled) {
     rows.push(["UniFi", "no data yet"]);
+    rows.push(...sshRows(st.ssh));
   } else {
     rows.push(["UniFi", "not configured"]);
+    rows.push(...sshRows(st.ssh));
   }
   $("#gateway").innerHTML = `<dl class="kv">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`;
 }
