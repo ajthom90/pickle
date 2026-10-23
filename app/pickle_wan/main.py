@@ -247,7 +247,7 @@ def _result_rows(since, until, check):
     if check:
         sql += " AND check_id = ?"
         args.append(check)
-    for r in db.conn.execute(sql + " ORDER BY ts", args):
+    for r in db.stream(sql + " ORDER BY ts", args):
         c = monitor.by_id.get(r["check_id"], {})
         yield {"timestamp_utc": _iso(r["ts"]), "unix_ts": round(r["ts"], 3),
                "check_id": r["check_id"], "check_name": c.get("name", ""),
@@ -373,7 +373,7 @@ def export_load_csv(hours: float = 24 * 7, since: float | None = None,
              "download_mbps": num(r["rx_bps"], 1e6), "upload_mbps": num(r["tx_bps"], 1e6),
              "cpu_pct": num(r["cpu"]), "mem_pct": num(r["mem"]), "temp_c": num(r["temp"], 1, 1),
              "clients": r["clients"]}
-            for r in db.conn.execute("SELECT * FROM load WHERE ts >= ? AND ts <= ? ORDER BY ts",
+            for r in db.stream("SELECT * FROM load WHERE ts >= ? AND ts <= ? ORDER BY ts",
                                      (since, until)))
     return _csv_stream(["timestamp_utc", "unix_ts", "download_mbps", "upload_mbps", "cpu_pct",
                         "mem_pct", "temp_c", "clients"], rows,

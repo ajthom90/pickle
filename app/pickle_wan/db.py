@@ -97,6 +97,16 @@ class DB:
             self._local.conn = c
         return c
 
+    def stream(self, sql, args=()):
+        """Yield rows from a connection of its own, for streaming exports. A streamed response
+        can be advanced on different pool threads, so it mustn't share a thread's connection."""
+        c = sqlite3.connect(self.path, timeout=15, check_same_thread=False)
+        c.row_factory = sqlite3.Row
+        try:
+            yield from c.execute(sql, args)
+        finally:
+            c.close()
+
     def q(self, sql, args=()):
         return self.conn.execute(sql, args).fetchall()
 
