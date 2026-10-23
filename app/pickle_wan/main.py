@@ -214,7 +214,8 @@ def events(hours: float = 24, since: float | None = None, until: float | None = 
     return [dict(r) | {"data": json.loads(r["data"]) if r["data"] else None}
             # Plain router log lines are many; they're shown with each outage instead.
             for r in db.q("SELECT ts, source, kind, message, data FROM events "
-                          "WHERE ts >= ? AND ts <= ? AND NOT (source = 'router_log' AND kind = 'log') "
+                          "WHERE ts >= ? AND ts <= ? AND NOT (source = 'router_log' "
+                          "AND kind IN ('log', 'link_up', 'link_down', 'dhcpv6_probe')) "
                           "ORDER BY ts DESC LIMIT 500", (since, until))]
 
 

@@ -87,8 +87,9 @@ DEFAULTS = {
         "onsite_note": (
             "On site, before touching anything:\n"
             "1. Photograph the ONT (Network Status light, ETH1 lights).\n"
-            "2. If you can, SSH to the router and run `ping {isp_gateway}` and `ip neigh`; "
-            "note whether {isp_gateway} shows FAILED or INCOMPLETE.\n"
+            "2. If you can, SSH to the router and run `ping {isp_gateway}` and `ip neigh` "
+            "(note whether {isp_gateway} shows FAILED or INCOMPLETE), and `ip -s link show "
+            "{wan_iface}` twice, 10 s apart (note whether RX packets keep rising).\n"
             "3. Then re-plug only the router's WAN cable and note the time."),
     },
     "checks": None,

@@ -1,5 +1,6 @@
 """Turns raw check results into outages with a verdict on where the fault was."""
 import json
+import re
 import time
 
 # Incidents on checks with these roles start an outage window.
@@ -95,17 +96,30 @@ def classify(db, checks_by_id, w):
     human = bool(user_note and user_note["human_action"])
     # Someone on site (moving power, re-plugging cables) explains reboots and port changes, so
     # with the human-action flag they don't decide the verdict; the port state is then unknown.
-    relevant_ports = _relevant_port_events(events, start, end)
-    set_aside = [e for e in events if human and (e["kind"] == "reboot" or e in relevant_ports)]
+    rebooted = any(e["kind"] == "reboot" for e in events)
+    # WAN port changes: the router's own log gives the exact second. Use it instead of UniFi's
+    # polled events when that log covers the outage (and the WAN interface is known); otherwise
+    # use both, so a partial router log can't erase the only record of a drop.
+    router_ports = router_link_events(db, start, end)
+    unifi_ports = [e for e in events if e["kind"] == "wan_port"]
+    router_cov = bool(db.get_kv("router_wan_iface")) and router_log_covers(db, start, end, ongoing, rebooted)
+    if router_cov:
+        port_events = router_ports
+    else:
+        port_events = sorted(unifi_ports + router_ports, key=lambda e: e["ts"])
+    others = [e for e in events if e["kind"] != "wan_port"]
+    relevant_ports = _relevant_port_events(port_events, start, end)
+    set_aside = [e for e in others if human and e["kind"] == "reboot"]
+    set_aside += [e for e in relevant_ports if human]
     for e in set_aside:
         e["human_action"] = True
     reboots = [e for e in events if e["kind"] == "reboot" and not human]
-    port = port_story([e for e in events if e not in set_aside], start, end, ongoing)
+    port = port_story([e for e in others + port_events if e not in set_aside], start, end, ongoing)
     port["unknown"] = bool(set_aside)
+    port["source"] = "router_log" if port_events is router_ports and router_ports else "unifi"
     lease = lease_context(db, start, end, ongoing)
     recovery = recovery_snapshot(db, start, end)
-    router_log = router_log_context(db, start, end, ongoing,
-                                    rebooted=any(e["kind"] == "reboot" for e in events))
+    router_log = router_log_context(db, start, end, ongoing, rebooted=rebooted)
 
     def failed(role):
         return fail.get(role) is not None and fail[role] >= FAILING
@@ -114,7 +128,8 @@ def classify(db, checks_by_id, w):
         return fail.get(role) is not None and fail[role] < FAILING
 
     have_unifi = "gateway_api" in fail
-    stayed_up = have_unifi and not port["downs"] and not port["unknown"]
+    # The link is known to have stayed up if UniFi was polled or the router's log covers it.
+    stayed_up = (have_unifi or router_cov) and not port["downs"] and not port["unknown"]
     ended_by_renewal = not ongoing and (lease.get("renewed_at_end") or any(
         abs(d["at"] - end) <= RECOVER_PAD for d in lease.get("due", [])))
 
@@ -150,7 +165,7 @@ def classify(db, checks_by_id, w):
         if note:
             why += " " + note
         elif stayed_up and not ongoing:
-            why += (" UniFi saw no WAN port change and nothing marked the end (no reconnect or "
+            why += (f" {_who(port)} no WAN port change and nothing marked the end (no reconnect or "
                     "lease renewal), so this can't separate the ISP dropping his session from a "
                     "port that stopped passing traffic.")
         elif wan_ip_changed:
@@ -198,7 +213,7 @@ def isp_session_text(port, stayed_up, ended_by_renewal, wan_ip_changed):
     why = ("His WAN IP stopped answering while the ISP's gateway kept answering from the "
            "internet, and his router didn't reboot. ")
     if stayed_up:
-        why += "UniFi saw no WAN port change, so the link to the ONT stayed up. "
+        why += f"{_who(port)} no WAN port change, so the link to the ONT stayed up. "
     else:
         why += (f"His router's WAN link stayed up until about {port['late_minutes']} min in, "
                 f"when the port went DOWN: someone reconnecting, after traffic had already "
@@ -287,6 +302,14 @@ def _relevant_port_events(events, start, end):
     return out
 
 
+def _who(port):
+    return "His router's log shows" if port.get("source") == "router_log" else "UniFi saw"
+
+
+def _logged(port):
+    return "His router logged" if port.get("source") == "router_log" else "UniFi logged"
+
+
 def wan_port_note(port, start, wan_ip_changed):
     """Explain a WAN port DOWN for the Last mile verdict."""
     if not port["downs"]:
@@ -295,10 +318,10 @@ def wan_port_note(port, start, wan_ip_changed):
                if wan_ip_changed else "")
     lo, hi = port["window"]
     if port["at_start"]:
-        return ("UniFi logged the WAN port going DOWN as the outage began: the ONT dropped the "
+        return (f"{_logged(port)} the WAN port going DOWN as the outage began: the ONT dropped the "
                 "link, which is ISP equipment." + ip_note)
     if port["ambiguous"]:
-        return (f"UniFi logged the WAN port going DOWN, but pickle couldn't reach the gateway "
+        return (f"{_logged(port)} the WAN port going DOWN, but pickle couldn't reach the gateway "
                 f"between {_into(lo, start)} and {_into(hi, start)}, so it can't tell whether "
                 f"the port dropped when the outage began (the ONT dropping the link) or later "
                 f"(someone unplugging or power-cycling equipment)." + ip_note)
@@ -384,9 +407,51 @@ def outage_note(db, start, end):
 
 ROUTER_LEAD = 600   # seconds of router log shown before an outage
 # Router log findings worth adding to the verdict's explanation (others are shown, not argued).
-CALLOUTS = {"no_reply", "no_reply_logged", "answered_then_stopped", "quiet"}
+CALLOUTS = {"no_reply", "no_reply_logged", "answered_then_stopped", "quiet", "midlease"}
 ROUTER_REQUESTS = {"dhcp_renew", "dhcp_rebind", "dhcp_select", "dhcp_discover"}
-ROUTER_ANSWERS = {"dhcp_lease", "dhcp_ack"}
+ROUTER_ANSWERS = {"dhcp_lease", "dhcp_ack", "dhcp_offer"}
+ANSWER_WAIT = 10    # seconds; a DHCP request answered within this was answered
+FRESH_PAD = 60      # seconds; a request this soon after a link reset / client restart is "fresh"
+WORD = {"dhcp_renew": "renewal", "dhcp_rebind": "rebind", "dhcp_select": "request",
+        "dhcp_discover": "discover"}
+
+
+def _router_rows(db, lo, hi):
+    return [dict(r) | {"data": json.loads(r["data"]) if r["data"] else {}} for r in db.q(
+        "SELECT id, ts, kind, message, data FROM events WHERE source = 'router_log' "
+        "AND ts >= ? AND ts <= ? ORDER BY ts, id", (lo, hi))]
+
+
+def router_log_covers(db, start, end, ongoing=False, rebooted=False):
+    """Whether the router log can prove an absence for this window: it reaches back before
+    the outage, has lines after it, and no reboot (which can wipe or reset it) inside."""
+    if ongoing or rebooted:
+        return False
+    def trusted(rows_):
+        return any(not json.loads(a["data"] or "{}").get("clock_suspect") for a in rows_)
+    after = db.q("SELECT data FROM events WHERE source = 'router_log' AND kind != 'restart_record' "
+                 "AND ts > ? ORDER BY ts LIMIT 20", (end,))
+    before = db.q("SELECT data FROM events WHERE source = 'router_log' AND kind != 'restart_record' "
+                  "AND ts <= ? ORDER BY ts DESC LIMIT 20", (start,))
+    return trusted(after) and trusted(before)
+
+
+def router_link_events(db, start, end):
+    """WAN link down/up from the router's own log, shaped like UniFi's polled wan_port events
+    but exact (the change happened at the logged second, not somewhere between two polls)."""
+    wan = db.get_kv("router_wan_iface")
+    if not wan:
+        return []
+    out = []
+    for r in _router_rows(db, start - EVENT_PAD, end + EVENT_PAD):
+        if r["kind"] in ("link_down", "link_up") and r["data"].get("iface") == wan \
+                and not r["data"].get("clock_suspect"):
+            state = "DOWN" if r["kind"] == "link_down" else "UP"
+            out.append({"ts": r["ts"], "kind": "wan_port",
+                        "message": f"Router log: WAN link {state} ({wan})",
+                        "data": {"up": state == "UP", "since": r["ts"], "seen": r["ts"],
+                                 "source": "router_log"}})
+    return out
 
 
 def router_log_context(db, start, end, ongoing, rebooted=False):
@@ -394,43 +459,46 @@ def router_log_context(db, start, end, ongoing, rebooted=False):
     they say about the DHCP exchange. None if no router log has ever been collected."""
     if not db.q("SELECT 1 FROM events WHERE source = 'router_log' LIMIT 1"):
         return None
-    rows = [dict(r) | {"data": json.loads(r["data"]) if r["data"] else {}} for r in db.q(
-        "SELECT ts, kind, message, data FROM events WHERE source = 'router_log' "
-        "AND ts >= ? AND ts <= ? ORDER BY ts", (start - ROUTER_LEAD, end + UNIFI_POLL))]
+    wan = db.get_kv("router_wan_iface")
+    rows = _router_rows(db, start - ROUTER_LEAD, end + UNIFI_POLL)
     lines = [r for r in rows if not r["data"].get("clock_suspect")]
-    # The log only proves an absence if it covers the outage: it reaches back to before the
-    # outage, something was logged after it, and no reboot (which can wipe or reset the log)
-    # happened inside it.
-    def trusted(rows_):
-        return any(not json.loads(a["data"] or "{}").get("clock_suspect") for a in rows_)
-    after = db.q("SELECT data FROM events WHERE source = 'router_log' AND ts > ? "
-                 "ORDER BY ts LIMIT 20", (end,))
-    before_start = db.q("SELECT data FROM events WHERE source = 'router_log' AND ts <= ? "
-                        "ORDER BY ts DESC LIMIT 20", (start,))
-    covered = not ongoing and not rebooted and trusted(after) and trusted(before_start)
-    ctx = {"lines": [{"ts": r["ts"], "kind": r["kind"], "message": r["message"]} for r in lines],
+
+    def shown(r):
+        # other interfaces' link lines and Wi-Fi carrier noise aren't about his WAN
+        if r["kind"] in ("link_up", "link_down"):
+            return r["data"].get("iface") == wan
+        if r["kind"] == "log" and re.search(r"carrier|Link is", r["message"]):
+            return False
+        return True
+    covered = router_log_covers(db, start, end, ongoing, rebooted)
+    ctx = {"lines": [{"ts": r["ts"], "kind": r["kind"], "message": r["message"]}
+                     for r in lines if shown(r)],
            "suspect_lines": len(rows) - len(lines), "covered": covered,
-           "finding": None, "note": ""}
-    requests = [r for r in lines if r["kind"] in ROUTER_REQUESTS and r["ts"] <= end]
-    answers = [r for r in lines if r["kind"] in ROUTER_ANSWERS]
-    word = {"dhcp_renew": "renewal", "dhcp_rebind": "rebind", "dhcp_select": "request",
-            "dhcp_discover": "discover"}
+           "finding": None, "note": "", "facts": []}
+
+    # Requests and answers in log order (several can share a second).
+    dhcp = [r for r in lines if r["kind"] in ROUTER_REQUESTS | ROUTER_ANSWERS]
+    def answer_after(i):
+        return next((a for a in dhcp[i + 1:] if a["kind"] in ROUTER_ANSWERS), None)
     def unanswered(lo, hi):
-        """First request sent in [lo, hi) with no answer until the outage was ending."""
-        for r in requests:
-            if lo <= r["ts"] < hi:
-                nxt = next((a for a in answers if a["ts"] > r["ts"]), None)
-                if nxt is None or nxt["ts"] >= end - RECOVER_PAD:
+        """First request sent in [lo, hi) that wasn't answered promptly, and whose answer (if
+        any) only came as the outage was ending."""
+        for i, r in enumerate(dhcp):
+            if r["kind"] in ROUTER_REQUESTS and lo <= r["ts"] < hi and r["ts"] <= end:
+                nxt = answer_after(i)
+                if nxt is None or (nxt["ts"] - r["ts"] > ANSWER_WAIT and nxt["ts"] >= end - RECOVER_PAD):
                     return r, nxt
         return None
+
     # Only a request sent while traffic still flowed says something about the DHCP server:
     # once the line is dead, nothing gets a reply, whatever the cause.
     early = unanswered(start - ROUTER_LEAD, start)
     during = unanswered(start, end + 1)
-    before = [a for a in answers if start - ROUTER_LEAD <= a["ts"] < start]
+    midlease = None if (early or during or ongoing) else _midlease(db, lines, dhcp, start, end, wan)
+    before = [a for a in dhcp if a["kind"] in ROUTER_ANSWERS and start - ROUTER_LEAD <= a["ts"] < start]
     if early:
         r, nxt = early
-        sent = (f"His router sent a DHCP {word[r['kind']]} {_relative(r['ts'], start)}, while "
+        sent = (f"His router sent a DHCP {WORD[r['kind']]} {_relative(r['ts'], start)}, while "
                 f"traffic was still flowing")
         if nxt or covered:
             ctx["finding"] = "no_reply"
@@ -442,10 +510,12 @@ def router_log_context(db, start, end, ongoing, rebooted=False):
             ctx["note"] = (sent + "; no reply was logged before the outage ended, but the router "
                            "log doesn't clearly cover the whole outage (no later lines yet, or "
                            "a reboot), so a missing reply can't be confirmed.")
+    elif midlease:
+        ctx["finding"], ctx["note"] = "midlease", midlease
     elif during:
         r, nxt = during
         ctx["finding"] = "unanswered_during"
-        ctx["note"] = (f"His router's DHCP {word[r['kind']]} {_relative(r['ts'], start)} went "
+        ctx["note"] = (f"His router's DHCP {WORD[r['kind']]} {_relative(r['ts'], start)} went "
                        f"unanswered, which is expected during an outage whatever the cause"
                        + ("; service returned when the reply arrived." if nxt else "."))
     elif before:
@@ -454,14 +524,75 @@ def router_log_context(db, start, end, ongoing, rebooted=False):
         ctx["note"] = (f"His router's DHCP lease was renewed {_relative(a['ts'], start)}, so it "
                        f"held a valid lease when traffic stopped. That points at his router or "
                        f"the ISP's session, not the DHCP exchange.")
-    elif covered and not any(start <= r["ts"] <= end for r in requests + answers):
+    elif covered and not any(start <= r["ts"] <= end for r in dhcp):
         ctx["finding"] = "quiet"
         ctx["note"] = ("The router logged no DHCP activity during the outage: it still "
                        "considered its lease valid.")
     elif not covered and not ongoing:
         ctx["note"] = ("The router log doesn't cover this outage yet (no lines after it, or the "
                        "router rebooted).")
+
+    ctx["facts"] = _router_facts(lines, start, end)
+    if ctx["facts"]:
+        ctx["note"] = (ctx["note"] + " " if ctx["note"] else "") + " ".join(ctx["facts"])
     return ctx
+
+
+def _midlease(db, lines, dhcp, start, end, wan):
+    """Oct 22's pattern, stated as facts: a valid lease, no DHCP requests during the outage
+    until the link was reset (or the client restarted), then a fresh exchange answered at once
+    as service returned."""
+    # The lease in force when the outage began can be from well before the lines shown.
+    last = None
+    for r in db.q("SELECT ts, data FROM events WHERE source = 'router_log' AND kind = 'dhcp_lease' "
+                  "AND ts < ? ORDER BY ts DESC LIMIT 5", (start,)):
+        d = json.loads(r["data"] or "{}")
+        if not d.get("clock_suspect"):
+            last = {"ts": r["ts"], "data": d}
+            break
+    if not last or not last["data"].get("lease_time"):
+        return None
+    T = last["data"]["lease_time"]
+    if last["ts"] + T <= start:
+        return None
+    first_req = next((r for r in dhcp if r["kind"] in ROUTER_REQUESTS and r["ts"] >= start), None)
+    if not first_req or first_req["ts"] > end + RECOVER_PAD:
+        return None
+    resets = [r for r in lines if (r["kind"] in ("link_up", "dhcp_client_start")
+                                   and r["data"].get("iface") in (None, wan))
+              and first_req["ts"] - FRESH_PAD <= r["ts"] <= first_req["ts"]]
+    i = dhcp.index(first_req)
+    ans = next((a for a in dhcp[i + 1:] if a["kind"] in ROUTER_ANSWERS), None)
+    if not resets or not ans or ans["ts"] - first_req["ts"] > ANSWER_WAIT \
+            or abs(ans["ts"] - end) > RECOVER_PAD:
+        return None
+    new_lease = next((a for a in dhcp[i + 1:] if a["kind"] == "dhcp_lease"), None)
+    same_ip = new_lease and new_lease["data"].get("ip") == last["data"].get("ip")
+    how = "the link was reset" if any(r["kind"] == "link_up" for r in resets) else "the DHCP client restarted"
+    secs = max(1, round(ans["ts"] - first_req["ts"]))
+    return (f"His router's DHCP lease was valid: renewed {_dur(start - last['ts'])} before the "
+            f"outage, with {_dur(last['ts'] + T - start)} left. It made no DHCP requests during "
+            f"the outage until {how} {_relative(resets[0]['ts'], start)}; the fresh request was "
+            f"answered within {secs} s" + (" with the same IP" if same_ip else "")
+            + ", and service returned.")
+
+
+def _router_facts(lines, start, end):
+    """Other things the router itself logged during the outage, as plain facts."""
+    facts = []
+    v6 = [r for r in lines if r["kind"] == "dhcpv6_probe" and start - 60 <= r["ts"] <= end]
+    if v6 and not v6[0]["data"].get("ok"):
+        facts.append(f"His router's DHCPv6 probe {_relative(v6[0]['ts'], start)} got no answer, "
+                     f"so IPv6 had stopped too.")
+    downs = {}
+    for r in lines:
+        if r["kind"] == "wan_monitor" and r["data"].get("state") == "down" \
+                and start - 60 <= r["ts"] <= end:
+            downs.setdefault(r["data"].get("target"), r["ts"])
+    if downs:
+        parts = [f"{t} {_relative(ts, start)}" for t, ts in sorted(downs.items(), key=lambda x: x[1])]
+        facts.append("His router's own WAN monitors marked these down: " + ", ".join(parts) + ".")
+    return facts
 
 
 def recovery_snapshot(db, start, end):

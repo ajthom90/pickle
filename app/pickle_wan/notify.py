@@ -80,7 +80,8 @@ class Ntfy:
         if not note:
             return ""
         gw = monitor.resolve_target("{isp_gateway}") or "the ISP gateway"
-        return "\n\n" + note.replace("{isp_gateway}", gw)
+        wan = monitor.db.get_kv("router_wan_iface") or "<WAN interface, e.g. eth4>"
+        return "\n\n" + note.replace("{isp_gateway}", gw).replace("{wan_iface}", wan)
 
     # ---- outage notifications -----------------------------------------------
 

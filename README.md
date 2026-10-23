@@ -211,16 +211,28 @@ can't write to the topic.
 ## Router log over SSH (optional)
 
 With `ssh.enabled`, pickle logs in to his router through the WireGuard tunnel every 5
-minutes, and right after the gateway is reachable again after an outage, and reads its
-DHCP/WAN log lines: `grep -iE "dhcp|udhcpc|wan" /var/log/messages`, or `logread` /
-`journalctl` if that file doesn't exist. Each line is stored once, at the log line's own
-time. Lines without a year or timezone are placed using the router's clock and timezone,
-read in the same session, so DST changes are handled. The first collection reads further
-back (up to 20,000 matching lines), so older outages can get router evidence too if the
-router still has those lines.
+minutes, and right after the gateway is reachable again after an outage, and reads its WAN
+logs. On UniFi OS that means:
 
-udhcpc lines (renew sent, lease obtained with its lease time, discover, NAK, lease lost)
-and common dhclient lines become structured events. Lease lines feed the lease timing
+- `wan-diag-dhcp.log`, the WAN DHCP client's own log;
+- `wan-diag-port.log` and the WAN-related lines of `messages` and `daemon.log`: link up/down,
+  UniFi's WAN monitors (including any ping targets you add to the WAN SLA), the DHCPv6
+  probe, and the reset button;
+- `reboot-time.log`.
+
+On other routers it reads `grep -iE "dhcp|udhcpc|wan" /var/log/messages`, or `logread` /
+`journalctl`. Each line is stored once, at the log line's own time. Lines without a year or
+timezone are placed using the router's clock and timezone, read in the same session, so DST
+changes are handled. The first collection reads everything still on the router, including
+rotated files (on his router the DHCP log goes back months), so older outages get router
+evidence too.
+
+Only lines that positively come from the router's WAN DHCP client (udhcpc, or dhclient)
+count as DHCP evidence. The LAN's own DHCP server logs the same words for its clients, and
+those are ignored. udhcpc lines (renew sent, lease obtained with its lease time, discover,
+offer, request, client restarts) and common dhclient lines become structured events. WAN
+link up/down from the router's log gives the exact second the port changed, and replaces
+UniFi's polled port state when the log covers the outage. Lease lines feed the lease timing
 above. Each outage then lists the router's lines from 10 minutes before it to its end,
 and calls out:
 
@@ -231,7 +243,16 @@ and calls out:
   evidence: once the line is down, nothing gets a reply, whatever the cause.
 - **Renewal answered, then traffic stopped**: the router held a valid lease, so it points
   at the router or the ISP's session, not the DHCP exchange.
+- **Valid lease, then a fresh exchange answered at once**: the router renewed N minutes
+  before with M left, made no DHCP requests until the link was reset, and the fresh request
+  was answered within a second, with the same IP, as service returned. This was the Oct 22
+  pattern.
 - **No DHCP activity during the outage**: the router still considered its lease valid.
+
+It also lists what the router itself saw during the outage: a failed DHCPv6 probe, or its
+own WAN monitors (e.g. the ISP gateway) going down. The "outage started" notification's
+on-site checklist includes `ip -s link show <WAN interface>` twice, 10 s apart: RX packets
+still rising means traffic is still arriving from the ISP and his port is receiving.
 
 Lines from a reset clock (after a power cut, before NTP syncs) show up out of order. They
 are stored but flagged, and kept out of outage analysis. The dashboard's gateway panel shows

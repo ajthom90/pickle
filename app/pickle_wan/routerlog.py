@@ -14,6 +14,7 @@ Safety:
 import asyncio
 import datetime
 import hashlib
+import json
 import logging
 import re
 import time
@@ -24,15 +25,46 @@ import asyncssh
 log = logging.getLogger("pickle.routerlog")
 
 GREP = "grep -iE 'dhcp|udhcpc|wan'"
+# UniFi OS keeps the WAN DHCP client's log in wan-diag-dhcp.log (also in daemon.log), link
+# changes in messages / wan-diag-port.log, its WAN monitors in messages, and a reboot record.
+UGREP = ("grep -aiE 'udhcpc|dhcp-client|wan-failover|wf-monitor|wf-interface|carrier|"
+         "link is (up|down)|reset button|ui-probe-dhcpv6: (no advertise|received advertise)'")
+LINKGREP = "grep -aiE 'carrier|link is (up|down)'"
 # The only commands pickle ever runs on the router. All read-only, all constant strings.
+# Rotated files are read oldest first, so concatenation never looks like a clock jump.
 COMMANDS = {
     # router clock (epoch), UTC offset, zone name, uptime: to place syslog lines in time
     "clock": ("date +%s; date +%z; cat /etc/timezone 2>/dev/null || "
               "readlink /etc/localtime 2>/dev/null; echo; cat /proc/uptime"),
     # which log sources exist
-    "probe": ("test -f /var/log/messages && echo messages; "
+    "probe": ("test -f /var/log/wan-diag-dhcp.log && echo unifi; "
+              "test -f /var/log/messages && echo messages; "
               "command -v logread >/dev/null 2>&1 && echo logread; "
               "command -v journalctl >/dev/null 2>&1 && echo journalctl; true"),
+    # UniFi OS. Each read also takes the tail of the .1 file, so lines written just before
+    # a rotation aren't missed.
+    "unifi_dhcp": ("{ tail -n 300 /var/log/wan-diag-dhcp.log.1; tail -n 3000 /var/log/wan-diag-dhcp.log; } "
+                   "2>/dev/null"),
+    "unifi_messages": (f"{{ tail -n 20000 /var/log/messages.1; cat /var/log/messages; }} 2>/dev/null "
+                       f"| {UGREP} | tail -n 3000"),
+    "unifi_daemon": (f"{{ tail -n 20000 /var/log/daemon.log.1; cat /var/log/daemon.log; }} 2>/dev/null "
+                     f"| {UGREP} | tail -n 3000"),
+    "unifi_port": (f"{{ tail -n 300 /var/log/wan-diag-port.log.1; tail -n 3000 /var/log/wan-diag-port.log; }} "
+                   f"2>/dev/null | {LINKGREP}"),
+    "unifi_reboots": "cat /var/log/reboot-time.log 2>/dev/null",
+    # UniFi OS backfill: everything still on the router, oldest first.
+    "unifi_dhcp_backfill": ("{ for n in 9 8 7 6 5 4 3 2; do zcat /var/log/wan-diag-dhcp.log.$n.gz; done; "
+                            "cat /var/log/wan-diag-dhcp.log.1 /var/log/wan-diag-dhcp.log; } 2>/dev/null"),
+    "unifi_messages_backfill": (f"{{ for n in 4 3 2; do zstdcat /var/log/messages.$n.zst; done; "
+                                f"cat /var/log/messages.1 /var/log/messages; }} 2>/dev/null "
+                                f"| {UGREP} | tail -n 30000"),
+    "unifi_daemon_backfill": (f"{{ for n in 4 3 2; do zstdcat /var/log/daemon.log.$n.zst; done; "
+                              f"cat /var/log/daemon.log.1 /var/log/daemon.log; }} 2>/dev/null "
+                              f"| {UGREP} | tail -n 30000"),
+    "unifi_port_backfill": (f"{{ for n in 4 3 2; do zcat /var/log/wan-diag-port.log.$n.gz; done; "
+                            f"cat /var/log/wan-diag-port.log.1 /var/log/wan-diag-port.log; }} 2>/dev/null "
+                            f"| {LINKGREP}"),
+    # Other routers
     "messages": f"{GREP} /var/log/messages | tail -n 2000",
     "messages_backfill": f"{GREP} /var/log/messages | tail -n 20000",
     "logread": f"logread | {GREP} | tail -n 2000",
@@ -41,6 +73,9 @@ COMMANDS = {
     "journalctl_backfill": f"journalctl -o short-iso --no-pager -q -n 200000 | {GREP} | tail -n 20000",
 }
 SOURCES = ["messages", "logread", "journalctl"]
+# UniFi OS reads, in order: the DHCP log first, so the WAN interface is known for the rest.
+UNIFI_READS = ["unifi_dhcp", "unifi_port", "unifi_messages", "unifi_daemon"]
+BACKFILL_FLAG = "router_log_backfilled_v2"   # v1 only read /var/log/messages
 
 INTERVAL = 300
 MIN_GAP = 30          # seconds between collections, however often it's kicked
@@ -120,41 +155,125 @@ def _split(ts, rest):
 
 # ---- DHCP line parsing -----------------------------------------------------------------
 
-PATTERNS = [
-    # udhcpc (busybox): "lease of 93.187.143.116 obtained from 93.187.140.1, lease time 86400"
+# udhcpc (busybox, used by UniFi OS), matched on the text after "udhcpc: ".
+UDHCPC = [
     ("dhcp_lease", re.compile(r"lease of (?P<ip>[\d.]+) obtained(?: from (?P<server>[\d.]+))?,?\s+"
                               r"lease time (?P<lease_time>\d+)", re.I)),
-    ("dhcp_renew", re.compile(r"sending renew(?: to (?P<server>[\d.]+))?|performing dhcp renew", re.I)),
+    ("dhcp_renew", re.compile(r"sending renew(?: to (?:server )?(?P<server>[\d.]+))?|performing dhcp renew", re.I)),
     ("dhcp_rebind", re.compile(r"sending rebind", re.I)),
-    ("dhcp_select", re.compile(r"sending select for (?P<ip>[\d.]+)", re.I)),
-    ("dhcp_discover", re.compile(r"sending discover|DHCPDISCOVER", re.I)),
-    ("dhcp_nak", re.compile(r"\bDHCPNAK\b|received.*\bNAK\b", re.I)),
+    ("dhcp_select", re.compile(r"(?:sending|broadcasting) select for (?P<ip>[\d.]+)|sending request", re.I)),
+    ("dhcp_discover", re.compile(r"(?:sending|broadcasting) discover", re.I)),
+    ("dhcp_offer", re.compile(r"received offer of (?P<ip>[\d.]+)", re.I)),
+    ("dhcp_nak", re.compile(r"received nak|\bnak\b", re.I)),
     ("dhcp_lost", re.compile(r"lease lost|no lease, failing", re.I)),
-    ("dhcp_release", re.compile(r"sending release|DHCPRELEASE", re.I)),
-    # dhclient (ISC): "DHCPACK of X from Y", "bound to X -- renewal in N seconds"
-    ("dhcp_ack", re.compile(r"DHCPACK(?: of (?P<ip>[\d.]+))?(?: from (?P<server>[\d.]+))?", re.I)),
-    ("dhcp_ack", re.compile(r"bound to (?P<ip>[\d.]+) -- renewal in (?P<renewal_in>\d+)", re.I)),
-    ("dhcp_renew", re.compile(r"DHCPREQUEST", re.I)),
+    ("dhcp_release", re.compile(r"sending release", re.I)),
+    ("dhcp_client_start", re.compile(r"^started\b", re.I)),
+    ("dhcp_client_stop", re.compile(r"received sigterm", re.I)),
 ]
+# dhclient (ISC), only when the program is dhclient: other DHCP servers on the router (the
+# LAN's dnsmasq) log the same DHCPREQUEST / DHCPACK words for their own clients.
+DHCLIENT = [
+    ("dhcp_ack", re.compile(r"DHCPACK(?: of (?P<ip>[\d.]+))?(?: from (?P<server>[\d.]+))?")),
+    ("dhcp_ack", re.compile(r"bound to (?P<ip>[\d.]+) -- renewal in (?P<renewal_in>\d+)")),
+    ("dhcp_nak", re.compile(r"DHCPNAK")),
+    ("dhcp_discover", re.compile(r"DHCPDISCOVER")),
+    ("dhcp_renew", re.compile(r"DHCPREQUEST")),
+    ("dhcp_release", re.compile(r"DHCPRELEASE")),
+]
+IFACE_TAG = re.compile(r"\(interface:([\w.-]+)\)")
+# Wired interfaces only; Wi-Fi radios (ra0, rai1, ...) and switch "Port N" lines stay plain.
+LINK = re.compile(r"\b(?P<iface>(?:eth|wan|ppp|en)[\w.-]*): (?:Link is (?P<ud>Up|Down)|(?P<cg>Lost|Gained) carrier)")
+MONITOR = re.compile(r"wan-failover-monitor-\w+: (?P<mon>\S+) \((?P<src>[^)]*?)->(?P<dst>[^)]*)\) has [\w-]+ update: "
+                     r"(?P<target>\S+) is (?P<state>up|down)\b")
+WAN_STATE = re.compile(r"wan-failover-interfaces: wf-interface-(?P<iface>[\w.-]+) \((?P<ip>[^)]*)\) is (?P<state>\w+)")
+DHCPV6 = re.compile(r"ui-probe-dhcpv6: (?P<res>no Advertise received|received Advertise)", re.I)
+RESET = re.compile(r"reset button is (?P<action>released|pressed)", re.I)
+REBOOT_RECORD = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:?\d\d)?)\s+(Experience .+)$")
+
 REQUESTS = {"dhcp_renew", "dhcp_rebind", "dhcp_select", "dhcp_discover"}
-ANSWERS = {"dhcp_lease", "dhcp_ack"}
+ANSWERS = {"dhcp_lease", "dhcp_ack", "dhcp_offer"}
 
 
-def classify_line(ts, prog, text):
-    """(kind, data) for a log line's text."""
-    for kind, rx in PATTERNS:
-        m = rx.search(text)
-        if m:
-            data = {k: v for k, v in m.groupdict().items() if v is not None}
-            for k in ("lease_time", "renewal_in"):
-                if k in data:
-                    data[k] = int(data[k])
-            if kind == "dhcp_lease":
-                # same keys as the UniFi lease events, so lease timing can use either
-                data["obtained"] = ts
-                data["expires"] = ts + data["lease_time"]
-            return kind, data
-    return "log", {}
+def classify_line(ts, prog, text, wan_iface=None):
+    """(kind, data) for a log line. WAN DHCP kinds only for lines that positively come from
+    the router's WAN DHCP client (udhcpc, or dhclient), on the WAN interface if it's known."""
+    data = {}
+    tag = IFACE_TAG.search(text)
+    if tag:
+        data["iface"] = tag.group(1)
+    body = text[len("udhcpc:"):].strip() if text.lower().startswith("udhcpc:") else None
+    if body is None and prog == "udhcpc":
+        body = text
+    if body is not None:
+        if wan_iface and data.get("iface") and data["iface"] != wan_iface:
+            return "log", data
+        for kind, rx in UDHCPC:
+            m = rx.search(body)
+            if m:
+                return kind, _fields(kind, ts, m, data)
+        return "log", data
+    if prog == "dhclient":
+        for kind, rx in DHCLIENT:
+            m = rx.search(text)
+            if m:
+                return kind, _fields(kind, ts, m, data)
+        return "log", data
+    m = LINK.search(text)
+    if m:
+        data["iface"] = m.group("iface")
+        up = (m.group("ud") or "").lower() == "up" or m.group("cg") == "Gained"
+        return ("link_up" if up else "link_down"), data
+    m = MONITOR.search(text)
+    if m:
+        iface = re.search(r"wf-monitor-([\w.]+?)-\d", m.group("mon"))
+        data.update(target=m.group("target"), state=m.group("state"), monitor=m.group("mon"))
+        if iface:
+            data["iface"] = iface.group(1)
+        return "wan_monitor", data
+    m = WAN_STATE.search(text)
+    if m:
+        data.update(iface=m.group("iface"), state=m.group("state"))
+        return "wan_state", data
+    m = DHCPV6.search(text)
+    if m:
+        data["ok"] = m.group("res").lower().startswith("received")
+        return "dhcpv6_probe", data
+    m = RESET.search(text)
+    if m:
+        data["action"] = m.group("action").lower()
+        return "reset_button", data
+    return "log", data
+
+
+def _fields(kind, ts, m, data):
+    data.update({k: v for k, v in m.groupdict().items() if v is not None})
+    for k in ("lease_time", "renewal_in"):
+        if k in data:
+            data[k] = int(data[k])
+    if kind == "dhcp_lease":
+        # same keys as the UniFi lease events, so lease timing can use either
+        data["obtained"] = ts
+        data["expires"] = ts + data["lease_time"]
+    return data
+
+
+def reclassify(db):
+    """Re-derive kind/data for every stored router log line. Lines are stored once (dedup by
+    hash), so without this, lines collected by an older version would keep their old kind."""
+    wan_iface = db.get_kv("router_wan_iface")
+    changed = 0
+    for r in db.q("SELECT id, ts, kind, data FROM events WHERE source = 'router_log'"):
+        old = json.loads(r["data"]) if r["data"] else {}
+        if "prog" not in old or "text" not in old or old.get("record"):
+            continue
+        kind, data = classify_line(r["ts"], old["prog"], old["text"], wan_iface)
+        data.update(prog=old["prog"], text=old["text"])
+        if old.get("clock_suspect"):
+            data["clock_suspect"] = True
+        if kind != r["kind"] or data != old:
+            db.x("UPDATE events SET kind = ?, data = ? WHERE id = ?", (kind, json.dumps(data), r["id"]))
+            changed += 1
+    return changed
 
 
 # ---- collector ---------------------------------------------------------------------------
@@ -179,6 +298,9 @@ class RouterLog:
         self._kick.set()
 
     async def run(self):
+        changed = await asyncio.to_thread(reclassify, self.db)
+        if changed:
+            log.info("re-classified %d stored router log line(s)", changed)
         await asyncio.sleep(10)
         while True:
             if time.time() - self._last_run >= MIN_GAP:
@@ -269,18 +391,48 @@ class RouterLog:
         boot = router_now - float(uptime) if uptime and _isfloat(uptime) else None
 
         available = (await self._run(conn, "probe")).split()
-        source = next((s for s in SOURCES if s in available), None)
-        if not source:
-            self._set("connected", "no /var/log/messages, logread or journalctl on the router")
-            self.status["last_ok"] = time.time()
-            return
-        backfill = not self.db.get_kv("router_log_backfilled")
-        out = await self._run(conn, source + ("_backfill" if backfill else ""))
-        new = self.store(out.splitlines(), tz, router_now, boot)
+        backfill = not self.db.get_kv(BACKFILL_FLAG)
+        suffix = "_backfill" if backfill else ""
+        new = 0
+        if "unifi" in available:
+            source = "UniFi OS logs"
+            for name in UNIFI_READS:
+                new += self.store((await self._run(conn, name + suffix)).splitlines(),
+                                  tz, router_now, boot)
+            new += self.store_reboot_records((await self._run(conn, "unifi_reboots")).splitlines())
+        else:
+            source = next((s for s in SOURCES if s in available), None)
+            if not source:
+                self._set("connected", "no /var/log/messages, logread or journalctl on the router")
+                self.status["last_ok"] = time.time()
+                return
+            new = self.store((await self._run(conn, source + suffix)).splitlines(), tz, router_now, boot)
         if backfill:
-            self.db.set_kv("router_log_backfilled", time.time())
+            self.db.set_kv(BACKFILL_FLAG, time.time())
         self.status.update(source=source, new_lines=new, last_ok=time.time())
         self._set("connected", f"{new} new line(s) from {source}")
+
+    def store_reboot_records(self, lines):
+        """UniFi OS's reboot-time.log: when and how the router last restarted. Its time is when
+        the entry was written after boot (a few minutes late), so it's information only, never
+        used to place a reboot in an outage."""
+        new = 0
+        for line in lines:
+            m = REBOOT_RECORD.match(line.strip())
+            if not m:
+                continue
+            try:
+                ts = datetime.datetime.fromisoformat(m.group(1).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            text = m.group(2)
+            data = {"record": True, "text": text, "improper": "improper shutdown" in text,
+                    "upgrade": "upgrade reboot" in text}
+            uid = "rl:" + hashlib.sha1(line.strip().encode()).hexdigest()
+            if self.db.add_event("router_log", "restart_record", "reboot-time.log: " + line.strip()[:480],
+                                 data=data, ts=ts, uid=uid):
+                new += 1
+        return new
 
     def store(self, lines, tz, router_now, boot=None):
         """Store new lines as events. Dedup is by a hash of the whole line only, so rotated
@@ -288,6 +440,7 @@ class RouterLog:
         time can't be trusted (out of order, or ahead of the router's clock) are stored but
         flagged, and kept out of outage analysis."""
         new, latest = 0, None
+        wan_iface = self.db.get_kv("router_wan_iface")
         for line in lines:
             line = line.rstrip()
             if not line:
@@ -304,7 +457,11 @@ class RouterLog:
                 again = parse_line(line, tz, router_now, fold=1)
                 if again and again[0] >= latest - 300:
                     ts, prog, text = again
-            kind, data = classify_line(ts, prog, text)
+            kind, data = classify_line(ts, prog, text, wan_iface)
+            if kind.startswith("dhcp_") and data.get("iface") and data["iface"] != wan_iface:
+                # The WAN DHCP client names its interface: that's the WAN for link events.
+                wan_iface = data["iface"]
+                self.db.set_kv("router_wan_iface", wan_iface)
             data.update(prog=prog, text=text[:500])
             # A clock reset (after a power cut, before NTP syncs) shows up as lines that jump
             # backwards in a file that's written in order, or as lines from the future.
