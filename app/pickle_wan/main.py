@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import analysis, config, load
@@ -161,6 +161,29 @@ def outages(hours: float = 24, since: float | None = None, until: float | None =
     return list(reversed(_outages(since, until)))
 
 
+@app.post("/api/outage_note")
+async def save_outage_note(request: Request):
+    """Attach, change or remove the note on an outage. Body: {start, note, human_action}.
+    A note with empty text and no flag is removed."""
+    try:
+        body = await request.json()
+        start = float(body["start"])
+    except (ValueError, KeyError, TypeError):
+        return JSONResponse({"error": "body must be JSON with a numeric start"}, status_code=400)
+    text = str(body.get("note") or "").strip()[:2000]
+    human = bool(body.get("human_action"))
+    # Replace whatever note this outage already has (matched the same way as on read).
+    o = next((o for o in analysis.outages(db, monitor.by_id, start - 1, start + 1)
+              if abs(o["start"] - start) < 1), None)
+    end = (o["end"] or time.time()) if o else start
+    db.x("DELETE FROM outage_notes WHERE start >= ? AND start <= ?",
+         (start - analysis.MERGE_GAP, end))
+    if text or human:
+        db.x("INSERT INTO outage_notes (start, note, human_action, updated) VALUES (?, ?, ?, ?)",
+             (start, text, 1 if human else 0, time.time()))
+    return {"ok": True}
+
+
 @app.get("/api/load")
 def load_api(hours: float = 24, since: float | None = None, until: float | None = None,
              buckets: int = Query(120, ge=10, le=1000)):
@@ -282,7 +305,8 @@ def export_results_json(hours: float = 24, since: float | None = None,
         "Content-Disposition": f'attachment; filename="pickle-results_{_stamp(since, until)}.json"'})
 
 
-OUTAGE_COLS = ["start_utc", "end_utc", "duration_s", "verdict", "explanation", "failed_checks",
+OUTAGE_COLS = ["start_utc", "end_utc", "duration_s", "verdict", "explanation", "note",
+               "human_action", "failed_checks",
                "role_failure_rates", "unifi_events", "lease_obtained_utc", "lease_time_s",
                "lease_expires_utc", "lease_due_in_window", "lease_note", "after_recovery_utc",
                "after_recovery_wan_ip", "after_recovery_gateway", "after_recovery_wan_port",
@@ -327,7 +351,10 @@ def export_outages_csv(hours: float = 24 * 7, since: float | None = None,
     since, until = _range(hours, since, until)
     rows = ({"start_utc": _iso(o["start"]), "end_utc": _iso(o["end"]) or "ongoing",
              "duration_s": round(o["duration"]), "verdict": o["verdict_label"],
-             "explanation": o["explanation"], "failed_checks": " ".join(o["checks"]),
+             "explanation": o["explanation"],
+             "note": (o.get("note") or {}).get("text", ""),
+             "human_action": "yes" if (o.get("note") or {}).get("human_action") else "",
+             "failed_checks": " ".join(o["checks"]),
              "role_failure_rates": json.dumps(o["role_failure"]),
              "unifi_events": " | ".join(f"{_iso(e['ts'])} {e['message']}" for e in o["unifi_events"])}
             | _lease_cols(o) | _load_cols(o)
@@ -392,7 +419,10 @@ def report(hours: float = 24 * 7, since: float | None = None, until: float | Non
         f"<tr><td>{_ts(o['start'])}</td><td>{_ts(o['end']) or 'ongoing'}</td>"
         f"<td class=num>{_fmt_dur(o['duration'])}</td><td><b>{e(o['verdict_label'])}</b></td>"
         f"<td>{e(o['explanation'])}<br><small>Failed: {e(', '.join(o['checks']))}</small>"
-        + "".join(f"<br><small>UniFi {_ts(ev['ts'])}: {e(ev['message'])}</small>"
+        + (f"<br><small><b>Note{' (human action)' if o['note']['human_action'] else ''}:</b> "
+           f"{e(o['note']['text'] or '(no text)')}</small>" if o.get("note") else "")
+        + "".join(f"<br><small>UniFi {_ts(ev['ts'])}: {e(ev['message'])}"
+                  f"{' (set aside: human action)' if ev.get('human_action') else ''}</small>"
                   for ev in o["unifi_events"])
         + (f"<br><small>DHCP lease: {e(o['lease']['note'])}</small>"
            if o.get("lease") and o["lease"]["note"] not in o["explanation"] else "")

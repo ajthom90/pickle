@@ -1,7 +1,14 @@
-"""SQLite storage. All access happens on the event loop thread."""
+"""SQLite storage.
+
+The monitor writes from the event loop thread, while FastAPI runs the sync endpoints in a
+thread pool, several at once (the dashboard fetches six endpoints in parallel). A sqlite3
+connection must not be used by two threads at the same time, so each thread gets its own
+connection; WAL mode lets them read concurrently while the monitor writes.
+"""
 import json
 import os
 import sqlite3
+import threading
 import time
 
 DB_PATH = os.environ.get("PICKLE_DB", "/data/pickle.db")
@@ -52,6 +59,17 @@ CREATE TABLE IF NOT EXISTS load (
 );
 CREATE INDEX IF NOT EXISTS load_ts ON load (ts);
 
+-- Notes people attach to an outage from the dashboard. start is the outage's start when the
+-- note was saved; analysis.outage_note matches it to whichever outage window contains it.
+CREATE TABLE IF NOT EXISTS outage_notes (
+    id INTEGER PRIMARY KEY,
+    start REAL NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    human_action INTEGER NOT NULL DEFAULT 0,
+    updated REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS outage_notes_start ON outage_notes (start);
+
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -62,12 +80,22 @@ CREATE TABLE IF NOT EXISTS kv (
 class DB:
     def __init__(self, path=DB_PATH):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        self.path = path
+        self._local = threading.local()
         self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+
+    @property
+    def conn(self):
+        """This thread's connection."""
+        c = getattr(self._local, "conn", None)
+        if c is None:
+            c = sqlite3.connect(self.path, timeout=15, check_same_thread=False)
+            c.row_factory = sqlite3.Row
+            c.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn = c
+        return c
 
     def q(self, sql, args=()):
         return self.conn.execute(sql, args).fetchall()
@@ -108,3 +136,4 @@ class DB:
         self.x("DELETE FROM incidents WHERE end IS NOT NULL AND end < ?", (cutoff,))
         self.x("DELETE FROM events WHERE ts < ?", (cutoff,))
         self.x("DELETE FROM load WHERE ts < ?", (cutoff,))
+        self.x("DELETE FROM outage_notes WHERE start < ?", (cutoff,))

@@ -35,6 +35,18 @@ ICMP, so an uncorroborated alert is worth knowing about.
 > diagnosed from the outside checks plus what the gateway reports once it's reachable again
 > (uptime, WAN port events, alarms). The tunnel checks catch the partial failures in between.
 
+A reboot only counts toward an outage if the gateway's boot time (now minus its uptime,
+accurate to about a minute) falls inside the outage, give or take 60 s. A reboot after his
+internet already came back belongs to whatever happened next, not to that outage.
+
+### Outage notes
+
+Any outage can carry a note from the dashboard (**Add note** under its explanation), e.g.
+"Ed moved router to wall power ~10:59 PM". Notes show in the Outages panel, the outages CSV
+and `/report`. Tick **Human action** when someone on site caused the reboot or WAN port
+changes in that window. Those events then stay listed but don't decide the verdict, and the
+explanation says they were set aside.
+
 ### DHCP lease and recovery evidence
 
 Each outage also shows where it fell relative to his router's **DHCP lease**: how long after

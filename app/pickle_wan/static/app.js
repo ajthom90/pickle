@@ -117,19 +117,73 @@ function renderChecks(st, tl) {
   window._tl = tl;
 }
 
+// While a note editor is open, the periodic refresh leaves the outages table alone.
+let editingNote = null;
+let _outages = [];
+
+function noteHTML(o) {
+  if (editingNote != null && Math.abs(editingNote - o.start) < 1) {
+    const n = o.note || {};
+    return `<form class="note-form" data-start="${o.start}">
+      <textarea name="note" rows="2" maxlength="2000" placeholder="e.g. Ed moved router to wall power ~10:59 PM">${esc(n.text || "")}</textarea>
+      <label><input type="checkbox" name="human" ${n.human_action ? "checked" : ""}> Human action: someone on site caused the reboot / port changes in this window, so they shouldn't decide the verdict</label>
+      <div><button type="submit">Save note</button> <button type="button" class="note-cancel">Cancel</button></div>
+    </form>`;
+  }
+  const n = o.note;
+  const shown = n ? `<br><span class="note"><b>Note${n.human_action ? " (human action)" : ""}:</b> ${esc(n.text || "(no text)")}</span>` : "";
+  return `${shown}<br><a class="note-edit" data-start="${o.start}">${n ? "Edit note" : "Add note"}</a>`;
+}
+
 function renderOutages(list) {
+  _outages = list;
+  if (editingNote == null) drawOutages();
+}
+
+function drawOutages() {
+  const list = _outages;
   $("#outage-count").textContent = list.length ? `(${list.length})` : "";
   $("#outages tbody").innerHTML = list.map((o) => `<tr>
       <td class="num">${fmtTime(o.start)}${o.ongoing ? " · <b>ongoing</b>" : ""}</td>
       <td class="num">${fmtDur(o.duration)}</td>
       <td>${badge(VERDICT_STATUS[o.verdict] || "none", o.verdict_label)}</td>
       <td class="why">${esc(o.explanation)}<br><span class="muted">Failed: ${esc(o.checks.join(", "))}</span>${
-        o.unifi_events.map((e) => `<br><span class="muted">UniFi ${fmtTime(e.ts)}: ${esc(e.message)}</span>`).join("")}${
+        o.unifi_events.map((e) => `<br><span class="muted">UniFi ${fmtTime(e.ts)}: ${esc(e.message)}${e.human_action ? " (set aside: human action)" : ""}</span>`).join("")}${
         o.lease && !o.explanation.includes(o.lease.note) ? `<br><span class="muted">DHCP lease: ${esc(o.lease.note)}</span>` : ""}${
         o.recovery ? `<br><span class="muted">Right after recovery: ${esc(recoveryText(o.recovery))}</span>` : ""}${
-        o.load_before ? `<br><span class="muted">10 min before: ${esc(loadText(o.load_before))}</span>` : ""}</td>
+        o.load_before ? `<br><span class="muted">10 min before: ${esc(loadText(o.load_before))}</span>` : ""}${noteHTML(o)}</td>
     </tr>`).join("") || `<tr><td colspan="4" class="muted">No outages in this range.</td></tr>`;
 }
+
+function openNoteEditor(start) {
+  editingNote = start;
+  drawOutages();
+  const ta = document.querySelector("#outages .note-form textarea");
+  if (ta) ta.focus();
+}
+
+document.addEventListener("click", (ev) => {
+  const edit = ev.target.closest("#outages .note-edit");
+  if (edit) { ev.preventDefault(); openNoteEditor(Number(edit.dataset.start)); return; }
+  if (ev.target.closest("#outages .note-cancel")) { editingNote = null; drawOutages(); }
+});
+
+document.addEventListener("submit", async (ev) => {
+  const form = ev.target.closest("#outages .note-form");
+  if (!form) return;
+  ev.preventDefault();
+  const btn = form.querySelector("button[type=submit]");
+  btn.disabled = true; btn.textContent = "Saving…";
+  try {
+    const r = await fetch("/api/outage_note", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ start: Number(form.dataset.start), note: form.note.value, human_action: form.human.checked }) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    editingNote = null;
+    await refresh();
+  } catch (e) {
+    btn.disabled = false; btn.textContent = `Save failed (${e.message}); retry`;
+  }
+});
 
 const fmtMbps = (bps) => bps == null ? "–" : (bps / 1e6 >= 100 ? (bps / 1e6).toFixed(0) : (bps / 1e6).toFixed(1)) + " Mbps";
 

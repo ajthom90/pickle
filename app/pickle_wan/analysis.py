@@ -5,7 +5,8 @@ import time
 # Incidents on checks with these roles start an outage window.
 TRIGGER_ROLES = {"wan", "internet", "dns"}
 MERGE_GAP = 60      # seconds; incidents closer than this are one outage
-EVENT_PAD = 300     # seconds; reboots/IP changes this close to a window count toward it
+EVENT_PAD = 300     # seconds; IP changes and port events this close to a window count toward it
+REBOOT_PAD = 60     # seconds; boot time (now - uptime) is accurate to about a minute
 ALERT_PAD = 90      # seconds; same for UniFi alarms and events
 FAILING = 0.5       # a role "failed" in a window if >= this share of its results failed
 BASELINE = 3600     # seconds before a window used to spot checks that were already broken
@@ -81,14 +82,26 @@ def classify(db, checks_by_id, w):
     events = [e for e in db.q("SELECT ts, kind, message, data FROM events WHERE source = 'unifi' "
                               "AND ts >= ? AND ts <= ? ORDER BY ts",
                               (start - EVENT_PAD, end + EVENT_PAD))
-              # Reboots and IP changes are detected late, so they get a wide margin; alerts don't.
-              if e["kind"] in ("reboot", "wan_ip_change", "wan_port")
-              or (e["kind"] not in ("recovery", "dhcp_lease")
+              # A reboot event's time is the boot time, so it counts only if the gateway booted
+              # during the outage. IP and port changes are detected late (by polling), so they
+              # get a wide margin; alerts carry UniFi's own timestamps.
+              if (e["kind"] == "reboot" and start - REBOOT_PAD <= e["ts"] <= end + REBOOT_PAD)
+              or e["kind"] in ("wan_ip_change", "wan_port")
+              or (e["kind"] not in ("reboot", "recovery", "dhcp_lease")
                   and start - ALERT_PAD <= e["ts"] <= end + ALERT_PAD)]
     events = [dict(e) | {"data": json.loads(e["data"]) if e["data"] else None} for e in events]
-    reboots = [e for e in events if e["kind"] == "reboot"]
     wan_ip_changed = any(e["kind"] == "wan_ip_change" for e in events)
-    port = port_story(events, start, end, ongoing)
+    user_note = outage_note(db, start, end)
+    human = bool(user_note and user_note["human_action"])
+    # Someone on site (moving power, re-plugging cables) explains reboots and port changes, so
+    # with the human-action flag they don't decide the verdict; the port state is then unknown.
+    relevant_ports = _relevant_port_events(events, start, end)
+    set_aside = [e for e in events if human and (e["kind"] == "reboot" or e in relevant_ports)]
+    for e in set_aside:
+        e["human_action"] = True
+    reboots = [e for e in events if e["kind"] == "reboot" and not human]
+    port = port_story([e for e in events if e not in set_aside], start, end, ongoing)
+    port["unknown"] = bool(set_aside)
     lease = lease_context(db, start, end, ongoing)
     recovery = recovery_snapshot(db, start, end)
 
@@ -99,7 +112,7 @@ def classify(db, checks_by_id, w):
         return fail.get(role) is not None and fail[role] < FAILING
 
     have_unifi = "gateway_api" in fail
-    stayed_up = have_unifi and not port["downs"]
+    stayed_up = have_unifi and not port["downs"] and not port["unknown"]
     ended_by_renewal = not ongoing and (lease.get("renewed_at_end") or any(
         abs(d["at"] - end) <= RECOVER_PAD for d in lease.get("due", [])))
 
@@ -122,7 +135,10 @@ def classify(db, checks_by_id, w):
         code = "last_mile"
         why = ("His WAN IP stopped answering while the ISP's upstream router stayed reachable"
                if ok("isp_hop") else "His WAN IP stopped answering")
-        if have_unifi:
+        if set_aside:
+            why += ". The fault is between the ISP's gateway and his router: the fiber, the ONT, "
+            why += "a WAN port, or his router."
+        elif have_unifi:
             why += ("; UniFi shows the gateway did not reboot. That isolates the link between "
                     "the ISP's gateway and his router: the fiber, the ONT, or a WAN port.")
         else:
@@ -152,6 +168,12 @@ def classify(db, checks_by_id, w):
 
     if code in WAN_VERDICTS and lease.get("due"):
         why += " " + lease["note"]
+    if set_aside:
+        kinds = sorted({"the gateway reboot" if e["kind"] == "reboot" else "the WAN port changes"
+                        for e in set_aside})
+        verb = "was" if kinds == ["the gateway reboot"] else "were"
+        why += (f" Marked as human action, so {' and '.join(kinds)} in this window {verb} left "
+                f"out of the verdict.")
 
     return {
         "start": w["start"], "end": w["end"],
@@ -163,6 +185,7 @@ def classify(db, checks_by_id, w):
         "unifi_events": events,
         "lease": lease,
         "recovery": recovery,
+        "note": user_note,
     }
 
 
@@ -217,7 +240,7 @@ def port_story(events, start, end, ongoing):
     """What UniFi saw his WAN port do around an outage. Only a drop at the start of the
     outage means the ONT dropped the link; a drop well into it came after traffic had
     already stopped, which is what someone unplugging or power-cycling equipment looks like."""
-    downs = [e for e in events if e["kind"] == "wan_port" and "DOWN" in e["message"]]
+    downs = [e for e in _relevant_port_events(events, start, end) if "DOWN" in e["message"]]
     story = {"downs": downs, "at_start": False, "ambiguous": False, "late": False,
              "ended_by_reconnect": False, "late_minutes": None, "window": None}
     if not downs:
@@ -237,6 +260,26 @@ def port_story(events, start, end, ongoing):
             up_lo, up_hi = _port_window(ups[0])
             story["ended_by_reconnect"] = up_lo - RECOVER_PAD <= end <= up_hi + RECOVER_PAD
     return story
+
+
+def _relevant_port_events(events, start, end):
+    """WAN port events that belong to this outage. A DOWN/UP cycle that was over before the
+    outage began, or a change that began after it ended, isn't part of it (the wide event
+    margin can pull in a neighbouring outage's reconnect)."""
+    ports = [e for e in events if e["kind"] == "wan_port"]
+    out = []
+    for i, e in enumerate(ports):
+        lo, hi = _port_window(e)
+        if lo > end:
+            continue
+        if "DOWN" in e["message"]:
+            nxt = next((u for u in ports[i + 1:] if "UP" in u["message"]), None)
+            if nxt and _port_window(nxt)[1] < start:
+                continue
+        elif hi < start:
+            continue
+        out.append(e)
+    return out
 
 
 def wan_port_note(port, start, wan_ip_changed):
@@ -316,6 +359,19 @@ def lease_context(db, start, end, ongoing):
         parts.append("The outage lines up with the lease renewal.")
     ctx["note"] = " ".join(parts)
     return ctx
+
+
+def outage_note(db, start, end):
+    """The note(s) someone attached to this outage. Matched by window rather than exact start,
+    because an ongoing outage's start can move earlier as more checks cross the threshold."""
+    rows = db.q("SELECT id, start, note, human_action, updated FROM outage_notes "
+                "WHERE start >= ? AND start <= ? ORDER BY start", (start - MERGE_GAP, end))
+    if not rows:
+        return None
+    return {"ids": [r["id"] for r in rows],
+            "text": " / ".join(r["note"] for r in rows if r["note"]),
+            "human_action": any(r["human_action"] for r in rows),
+            "updated": max(r["updated"] for r in rows)}
 
 
 def recovery_snapshot(db, start, end):

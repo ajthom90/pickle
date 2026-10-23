@@ -148,6 +148,15 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 .chart .dot { stroke: var(--surface); stroke-width: 2; }
 .key { display: inline-flex; align-items: center; gap: 5px; margin-left: 12px; color: var(--text-2); }
 .key i { width: 14px; height: 2px; border-radius: 1px; display: inline-block; }
+.note { color: var(--text); }
+.note-edit { font-size: 12px; }
+.note-form { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; max-width: 560px; }
+.note-form textarea { font: inherit; padding: 6px 8px; border: 1px solid var(--border);
+  border-radius: 6px; background: var(--surface); color: var(--text); resize: vertical; }
+.note-form label { font-size: 12px; color: var(--text-2); display: flex; gap: 6px; align-items: flex-start; }
+.note-form button { font: inherit; font-size: 13px; padding: 4px 12px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; }
+.note-form button[type=submit] { background: var(--accent); border-color: var(--accent); color: #fff; }
 .tip { position: fixed; z-index: 10; pointer-events: none; background: var(--surface);
   color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
   font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.15); max-width: 280px; }
