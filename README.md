@@ -264,11 +264,11 @@ on his router. If that's a concern:
 
 ## Configuration
 
-
 **Times.** Everything is stored and compared in UTC. Times are converted only for display:
 the dashboard and `/report` use `display_timezone`, or the container's `TZ` if that's unset.
 Every viewer sees the same clock, wherever their browser is. CSV exports stay in UTC, and
 the outages CSV adds `start_local` / `end_local` for tickets.
+
 See `config/config.example.yaml`. Everything except `target.wan_host` has a default. Defaults:
 checks every 15 s, an incident after 2 consecutive failures, 90 days of retention.
 Extra checks (`ping`, `tcp`, `dns`, `http`, over `external` or `vpn`) can be added under
