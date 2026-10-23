@@ -11,6 +11,7 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -25,6 +26,8 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 CFG = config.load()
+# Times are stored and compared as UTC epochs; this zone is only for showing them.
+DISPLAY_TZ = ZoneInfo(CFG["display_timezone"])
 db = DB()
 monitor = Monitor(CFG, db)
 STATIC = os.path.join(os.path.dirname(__file__), "static")
@@ -106,6 +109,7 @@ def status():
     open_outages = [o for o in analysis.outages(db, monitor.by_id, now - 3600, now) if o["ongoing"]]
     return {
         "now": now, "started": monitor.started,
+        "display_timezone": CFG["display_timezone"],
         "wan_host": CFG["target"]["wan_host"], "wan_ip": monitor.wan_ip,
         "hops": monitor.effective_hops(), "hop_traces": monitor.hop_traces,
         "checks": checks, "tunnel": tunnel,
@@ -309,7 +313,7 @@ def export_results_json(hours: float = 24, since: float | None = None,
         "Content-Disposition": f'attachment; filename="pickle-results_{_stamp(since, until)}.json"'})
 
 
-OUTAGE_COLS = ["start_utc", "end_utc", "duration_s", "verdict", "explanation", "note",
+OUTAGE_COLS = ["start_utc", "end_utc", "start_local", "end_local", "duration_s", "verdict", "explanation", "note",
                "human_action", "failed_checks",
                "role_failure_rates", "unifi_events", "lease_obtained_utc", "lease_time_s",
                "lease_expires_utc", "lease_due_in_window", "lease_note", "after_recovery_utc",
@@ -362,6 +366,7 @@ def export_outages_csv(hours: float = 24 * 7, since: float | None = None,
                        until: float | None = None):
     since, until = _range(hours, since, until)
     rows = ({"start_utc": _iso(o["start"]), "end_utc": _iso(o["end"]) or "ongoing",
+             "start_local": _ts(o["start"]), "end_local": _ts(o["end"]) or "ongoing",
              "duration_s": round(o["duration"]), "verdict": o["verdict_label"],
              "explanation": o["explanation"],
              "note": (o.get("note") or {}).get("text", ""),
@@ -470,7 +475,7 @@ th{{background:#f3f2ee}} .num{{text-align:right;font-variant-numeric:tabular-num
 .meta{{color:#52514e}} @media print{{a{{display:none}}}}
 </style></head><body>
 <h1>Internet connectivity report: {e(CFG['target']['wan_host'])}</h1>
-<div class=meta>Period {_ts(since)} to {_ts(until)} (UTC). Generated {_ts(time.time())}. <a href="javascript:print()">Print / save as PDF</a></div>
+<div class=meta>Period {_ts(since)} to {_ts(until)}. Generated {_ts(time.time())}. Times in {e(CFG['display_timezone'])}; the CSV exports are in UTC. <a href="javascript:print()">Print / save as PDF</a></div>
 <h2>Summary</h2>
 <p>{len(outs)} outage window(s){': ' + summary if summary else ''}.</p>
 <h2>Method</h2>
@@ -482,14 +487,14 @@ the gateway's uptime is unbroken, places the fault in the ISP network. When his 
 the ISP's gateway still does, his router's link stays up, and service returns only when the router makes a fresh DHCP
 request (reconnecting the cable or renewing its lease), the ISP had stopped serving his router's existing session.</p>
 <h2>Outages</h2>
-<table><tr><th>Start (UTC)</th><th>End (UTC)</th><th>Duration</th><th>Verdict</th><th>Evidence</th></tr>{outage_rows}</table>
+<table><tr><th>Start</th><th>End</th><th>Duration</th><th>Verdict</th><th>Evidence</th></tr>{outage_rows}</table>
 <h2>Load vs. outages</h2>
 <p>Gateway load comes from the UniFi API. For each outage, pickle takes the peak of each measure in the 10 minutes
 before it began and ranks it against every 10-minute window on record ({(corr or {}).get('history_hours', 0)} h of history,
 not just this period). If load played no part, about 10% of outages would start in the busiest 10% of windows by chance.</p>
 <table><tr><th>Measure</th><th class=num>Outages in busiest 10%</th><th class=num>Expected by chance</th><th>Finding</th></tr>{load_rows}</table>
 <h2>UniFi WAN alerts vs. external evidence</h2>
-<table><tr><th>Time (UTC)</th><th>UniFi alert</th><th>Confirmed from outside?</th></tr>{alert_rows}</table>
+<table><tr><th>Time</th><th>UniFi alert</th><th>Confirmed from outside?</th></tr>{alert_rows}</table>
 <h2>Check availability</h2>
 <table><tr><th>Check</th><th>Path</th><th>Target</th><th class=num>Samples</th><th class=num>Success</th><th class=num>Avg ms</th></tr>{check_rows}</table>
 <p class=meta>Raw per-check results for this period: <a href="/export/results.csv?since={since}&until={until}">CSV</a> · <a href="/export/results.json?since={since}&until={until}">JSON</a></p>
@@ -498,7 +503,7 @@ not just this period). If load played no part, about 10% of outages would start 
 
 def _recovery_text(rec):
     """One line describing his gateway's WAN state at the first poll after an outage."""
-    parts = [f"{_ts(rec['ts'])} UTC"]
+    parts = [_ts(rec["ts"])]
     if rec.get("wan_ip"):
         parts.append(f"WAN IP {rec['wan_ip']}")
     if rec.get("isp_gateway"):
@@ -510,7 +515,7 @@ def _recovery_text(rec):
         parts.append(f"WAN up {_fmt_dur(rec['wan_uptime'])}")
     lease = rec.get("lease") or {}
     if lease.get("obtained"):
-        parts.append(f"lease obtained {_ts(lease['obtained'])} UTC")
+        parts.append(f"lease obtained {_ts(lease['obtained'])}")
     if lease.get("lease_time"):
         parts.append(f"lease time {_fmt_dur(lease['lease_time'])}")
     if not lease:
@@ -543,7 +548,8 @@ def _path_label(c):
 
 
 def _ts(ts):
-    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if ts else ""
+    """A time for people to read: in the display timezone, with its abbreviation."""
+    return datetime.fromtimestamp(ts, DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S %Z") if ts else ""
 
 
 def _fmt_dur(s):

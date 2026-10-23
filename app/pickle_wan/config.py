@@ -3,6 +3,7 @@ import os
 import re
 
 import yaml
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .analysis import VERDICTS
 
@@ -23,6 +24,9 @@ ROLES = ["wan", "isp_hop", "control", "tunnel", "gateway", "isp_hop_inside",
          "internet", "dns", "gateway_api"]
 
 DEFAULTS = {
+    # Everything is stored and computed in UTC; this is only the timezone times are shown
+    # in (dashboard, report). Empty = the container's TZ environment variable, else UTC.
+    "display_timezone": "",
     "interval_seconds": 15,
     "fail_threshold": 2,
     "retention_days": 90,
@@ -157,6 +161,13 @@ def load(path=CONFIG_PATH):
         unknown = set(n["ignore_verdicts"] or []) - set(VERDICTS)
         if unknown:
             raise SystemExit(f"config: ntfy.ignore_verdicts has unknown verdicts {sorted(unknown)}")
+    tzname = (cfg.get("display_timezone") or os.environ.get("TZ") or "UTC").strip().lstrip(":")
+    try:
+        ZoneInfo(tzname)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise SystemExit(f"config: display_timezone / TZ {tzname!r} isn't a known timezone "
+                         f"(use a name like America/Chicago)")
+    cfg["display_timezone"] = tzname
     cfg["checks"] = build_checks(cfg)
     return cfg
 

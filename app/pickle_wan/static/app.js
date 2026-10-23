@@ -20,8 +20,13 @@ const STATUS = {
 const VERDICT_STATUS = { isp: "critical", last_mile: "critical", upstream: "critical", isp_session: "critical",
   router: "warning", dns: "warning", tunnel: "none", monitor: "none", unknown: "none" };
 
+// Times arrive as UTC epochs and are shown in the monitor's display timezone (from /api/status),
+// so every viewer sees the same clock as the report, wherever their browser is.
+let TZ;
 const fmtTime = (ts) => new Date(ts * 1000).toLocaleString([], { month: "short", day: "numeric",
-  hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: TZ });
+const fmtClock = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZone: TZ });
+const fmtDay = (ts) => new Date(ts * 1000).toLocaleDateString([], { month: "short", day: "numeric", timeZone: TZ });
 const fmtDur = (s) => {
   s = Math.round(s);
   if (s < 60) return `${s}s`;
@@ -61,7 +66,8 @@ function setExports() {
 }
 
 function renderHeader(st) {
-  $("#wan").textContent = `Watching ${st.wan_host}` + (st.wan_ip && st.wan_ip !== st.wan_host ? ` (${st.wan_ip})` : "");
+  $("#wan").textContent = `Watching ${st.wan_host}` + (st.wan_ip && st.wan_ip !== st.wan_host ? ` (${st.wan_ip})` : "")
+    + (st.display_timezone ? ` · times in ${st.display_timezone}` : "");
   const o = st.ongoing_outage;
   let cls = "good", text = "All clear";
   if (o) {
@@ -110,8 +116,7 @@ function renderChecks(st, tl) {
 
   const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => {
     const t = tl.since + (tl.until - tl.since) * f;
-    const d = new Date(t * 1000);
-    return `<span>${hours > 24 ? d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " : ""}${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>`;
+    return `<span>${hours > 24 ? fmtDay(t) + " " : ""}${fmtClock(t)}</span>`;
   }).join("");
   $("#axis").innerHTML = `<span></span><span></span><span class="muted">24h up · latency</span><span class="ticks">${ticks}</span>`;
   window._tl = tl;
@@ -274,8 +279,8 @@ function lineChart(title, ld, opts) {
     return `<path class="line" d="${d}" stroke="var(${ser.color})"/>`;
   }).join("");
   const ticks = [0, 0.5, 1].map((f) => {
-    const t = s.since + (s.until - s.since) * f, d = new Date(t * 1000);
-    const lab = (hours > 24 ? d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " : "") + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const t = s.since + (s.until - s.since) * f;
+    const lab = (hours > 24 ? fmtDay(t) + " " : "") + fmtClock(t);
     return `<text class="axis-label" x="${pad.l + f * iw}" y="${H - 4}" text-anchor="${["start", "middle", "end"][f * 2]}">${lab}</text>`;
   }).join("");
   const keys = opts.series.length > 1 ? opts.series.map((ser) => `<span class="key"><i style="background:var(${ser.color})"></i>${esc(ser.label)}</span>`).join("") : "";
@@ -443,6 +448,7 @@ async function refresh() {
       getJSON("/api/status"), getJSON(`/api/timeline?${q}&buckets=${hours <= 1 ? 60 : 120}`),
       getJSON(`/api/outages?${q}`), getJSON(`/api/unifi_alerts?${q}`), getJSON(`/api/events?${q}`),
       getJSON(`/api/load?${q}&buckets=${hours <= 1 ? 60 : 120}`)]);
+    TZ = st.display_timezone || undefined;
     renderHeader(st); renderChecks(st, tl); renderOutages(outs); renderLoad(ld);
     renderGateway(st); renderPath(st); renderAlerts(alerts); renderEvents(events);
   } catch (e) {
@@ -465,7 +471,7 @@ document.addEventListener("mousemove", (ev) => {
       (b.lat != null ? `<br>avg ${b.lat.toFixed(1)} ms` : "") +
       (b.loss != null && b.loss > 0 ? `<br>${(b.loss * 100).toFixed(1)}% packet loss` : "");
   }
-  tip.innerHTML = `<b>${fmtTime(t0)} – ${new Date(t1 * 1000).toLocaleTimeString()}</b>${body}`;
+  tip.innerHTML = `<b>${fmtTime(t0)} – ${new Date(t1 * 1000).toLocaleTimeString([], { timeZone: TZ })}</b>${body}`;
   tip.hidden = false;
   const x = Math.min(ev.clientX + 12, window.innerWidth - tip.offsetWidth - 8);
   tip.style.left = x + "px";

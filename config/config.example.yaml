@@ -18,6 +18,10 @@ target:
 # window is marked inconclusive rather than blamed on anyone.
 control_targets: [1.1.1.1, 8.8.8.8]
 
+# Times are stored in UTC and only converted for display (dashboard and report).
+# Empty uses the container's TZ setting from the compose file.
+display_timezone: ""        # e.g. America/Chicago
+
 interval_seconds: 15   # how often each check runs
 fail_threshold: 2      # consecutive failures before an incident opens
 retention_days: 90
