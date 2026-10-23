@@ -56,6 +56,7 @@ function setExports() {
   $("#x-results-json").href = `/export/results.json?${q}`;
   $("#x-outages-csv").href = `/export/outages.csv?${q}`;
   $("#x-events-csv").href = `/export/events.csv?${q}`;
+  $("#x-load-csv").href = `/export/load.csv?${q}`;
   $("#x-report").href = `/report?${q}`;
 }
 
@@ -123,9 +124,123 @@ function renderOutages(list) {
       <td class="num">${fmtDur(o.duration)}</td>
       <td>${badge(VERDICT_STATUS[o.verdict] || "none", o.verdict_label)}</td>
       <td class="why">${esc(o.explanation)}<br><span class="muted">Failed: ${esc(o.checks.join(", "))}</span>${
-        o.unifi_events.map((e) => `<br><span class="muted">UniFi ${fmtTime(e.ts)}: ${esc(e.message)}</span>`).join("")}</td>
+        o.unifi_events.map((e) => `<br><span class="muted">UniFi ${fmtTime(e.ts)}: ${esc(e.message)}</span>`).join("")}${
+        o.load_before ? `<br><span class="muted">10 min before: ${esc(loadText(o.load_before))}</span>` : ""}</td>
     </tr>`).join("") || `<tr><td colspan="4" class="muted">No outages in this range.</td></tr>`;
 }
+
+const fmtMbps = (bps) => bps == null ? "–" : (bps / 1e6 >= 100 ? (bps / 1e6).toFixed(0) : (bps / 1e6).toFixed(1)) + " Mbps";
+
+function loadText(lb) {
+  const parts = [];
+  for (const [k, label] of [["rx_bps", "down"], ["tx_bps", "up"]]) {
+    if (lb[k] == null) continue;
+    const u = lb[k + "_util"];
+    parts.push(`${fmtMbps(lb[k])} ${label}${u != null ? ` (${Math.round(u * 100)}% of line)` : ""}`);
+  }
+  if (lb.cpu != null) parts.push(`CPU ${Math.round(lb.cpu)}%`);
+  if (lb.mem != null) parts.push(`memory ${Math.round(lb.mem)}%`);
+  if (lb.temp != null) parts.push(`${Math.round(lb.temp)}°C`);
+  if (lb.clients != null) parts.push(`${lb.clients} clients`);
+  return parts.join(", ");
+}
+
+// Line chart over time buckets: one y-axis, outage bands, crosshair tooltip.
+function lineChart(title, ld, opts) {
+  const s = ld.series, W = Math.max(300, $("#load-charts").clientWidth), H = 150;
+  const pad = { l: 44, r: 8, t: 8, b: 20 }, iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+  const n = s.buckets.length;
+  const vals = opts.series.flatMap((ser) => s.buckets.map((b) => b ? b[ser.key] : null)).filter((v) => v != null);
+  let ymax = Math.max(opts.min || 0, ...vals, opts.cap || 0);
+  if (!vals.length) return `<div class="chart"><div class="chart-head"><b>${esc(title)}</b><span class="muted">no data in this range</span></div></div>`;
+  const nice = (v) => { const p = 10 ** Math.floor(Math.log10(v || 1)); return Math.ceil(v / p / (v / p > 5 ? 2 : 1)) * p * (v / p > 5 ? 2 : 1); };
+  ymax = opts.fixedMax || nice(ymax * 1.05);
+  const x = (i) => pad.l + (i + 0.5) / n * iw, y = (v) => pad.t + ih - v / ymax * ih;
+  const tx = (t) => pad.l + (t - s.since) / (s.until - s.since) * iw;
+  let g = "";
+  for (const f of [0, 0.5, 1]) {
+    const yy = pad.t + ih - f * ih;
+    g += `<line class="gridline" x1="${pad.l}" x2="${W - pad.r}" y1="${yy}" y2="${yy}"/><text class="axis-label" x="${pad.l - 6}" y="${yy + 4}" text-anchor="end">${opts.fmt(f * ymax)}</text>`;
+  }
+  const bands = ld.outages.map((o) => {
+    const a = Math.max(pad.l, tx(o.start)), b = Math.min(W - pad.r, tx(o.end ?? s.until));
+    return `<rect class="band" x="${a}" y="${pad.t}" width="${Math.max(2, b - a)}" height="${ih}"/>`;
+  }).join("");
+  const cap = opts.cap ? `<line class="cap" x1="${pad.l}" x2="${W - pad.r}" y1="${y(opts.cap)}" y2="${y(opts.cap)}"/>` : "";
+  const lines = opts.series.map((ser) => {
+    let d = "", pen = false;
+    s.buckets.forEach((b, i) => {
+      const v = b ? b[ser.key] : null;
+      if (v == null) { pen = false; return; }
+      d += `${pen ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`; pen = true;
+    });
+    return `<path class="line" d="${d}" stroke="var(${ser.color})"/>`;
+  }).join("");
+  const ticks = [0, 0.5, 1].map((f) => {
+    const t = s.since + (s.until - s.since) * f, d = new Date(t * 1000);
+    const lab = (hours > 24 ? d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " : "") + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return `<text class="axis-label" x="${pad.l + f * iw}" y="${H - 4}" text-anchor="${["start", "middle", "end"][f * 2]}">${lab}</text>`;
+  }).join("");
+  const keys = opts.series.length > 1 ? opts.series.map((ser) => `<span class="key"><i style="background:var(${ser.color})"></i>${esc(ser.label)}</span>`).join("") : "";
+  const capKey = opts.cap ? `<span class="key"><i style="background:var(--muted)"></i>${esc(opts.capLabel)}</span>` : "";
+  return `<div class="chart" data-chart="${opts.id}"><div class="chart-head"><b>${esc(title)}</b><span>${keys}${capKey}</span></div>
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${esc(title)}">${bands}${g}${cap}${lines}<g class="hover"></g>${ticks}
+    <rect x="${pad.l}" y="0" width="${iw}" height="${H}" fill="transparent" class="hit"/></svg></div>`;
+}
+
+let _load = null;
+function renderLoad(ld) {
+  _load = ld;
+  const card = $("#load-card");
+  card.hidden = !ld.unifi_enabled;
+  if (!ld.unifi_enabled) return;
+  const cap = ld.capacity || {};
+  $("#load-charts").innerHTML =
+    lineChart("WAN throughput (Mbps)", ld, { id: "tput", fmt: (v) => v === 0 ? "0" : fmtMbps(v).replace(" Mbps", ""),
+      series: [{ key: "rx", label: "Download", color: "--series-1" }, { key: "tx", label: "Upload", color: "--series-2" }],
+      cap: cap.rx_bps, capLabel: `Plan download (${cap.source === "config" ? "config" : "speed test"})`, min: 1e6 }) +
+    lineChart("Gateway CPU and memory (%)", ld, { id: "cpu", fmt: (v) => Math.round(v) + "%", fixedMax: 100,
+      series: [{ key: "cpu", label: "CPU", color: "--series-1" }, { key: "mem", label: "Memory", color: "--series-2" }] });
+  const c = ld.correlation || { metrics: [] };
+  const word = { linked: badge("warning", "Linked"), none: badge("good", "No link"), unclear: badge("none", "Unclear"), pending: badge("none", "Not yet") };
+  const counted = (m) => m.outages && m.verdict !== "pending";
+  $("#load-corr tbody").innerHTML = c.metrics.map((m) => `<tr><td>${esc(m.label)}</td><td class="num">${counted(m) ? `${m.busy} of ${m.outages}` : "–"}</td><td class="num">${counted(m) ? m.expected : "–"}</td><td>${word[m.verdict] || ""} <span class="muted">${esc(m.explanation)}</span></td></tr>`).join("")
+    || `<tr><td colspan="4" class="muted">No load data yet. It comes from the UniFi API once polls succeed.</td></tr>`;
+  $("#load-note").textContent = c.history_hours
+    ? `Based on all ${c.history_hours} h of load history and ${c.outages} outage(s), not just the range above. "Peak load" means the 10 minutes before an outage were busier than 90% of all 10-minute stretches on record.`
+    : "";
+}
+
+// Crosshair + tooltip for the load charts
+document.addEventListener("mousemove", (ev) => {
+  const hit = ev.target.closest && ev.target.closest(".chart .hit");
+  document.querySelectorAll(".chart .hover").forEach((h) => { if (!hit || !h.closest(".chart").contains(hit)) h.innerHTML = ""; });
+  if (!hit || !_load) return;
+  const svg = hit.ownerSVGElement, box = svg.getBoundingClientRect(), vb = svg.viewBox.baseVal;
+  const px = (ev.clientX - box.left) / box.width * vb.width;
+  const s = _load.series, n = s.buckets.length, pad = 44, iw = vb.width - pad - 8;
+  const i = Math.max(0, Math.min(n - 1, Math.floor((px - pad) / iw * n)));
+  const b = s.buckets[i], cx = pad + (i + 0.5) / n * iw;
+  svg.querySelector(".hover").innerHTML = `<line class="cross" x1="${cx}" x2="${cx}" y1="8" y2="${vb.height - 20}"/>`;
+  const t0 = s.since + i * s.width;
+  let body = "No data";
+  if (b) {
+    const rows = [];
+    if (b.rx != null) rows.push(`Download ${fmtMbps(b.rx)} avg · ${fmtMbps(b.rx_max)} peak`);
+    if (b.tx != null) rows.push(`Upload ${fmtMbps(b.tx)} avg · ${fmtMbps(b.tx_max)} peak`);
+    if (b.cpu != null) rows.push(`CPU ${b.cpu.toFixed(0)}% avg · ${b.cpu_max.toFixed(0)}% peak`);
+    if (b.mem != null) rows.push(`Memory ${b.mem.toFixed(0)}%`);
+    if (b.temp != null) rows.push(`Temperature ${b.temp.toFixed(0)}°C`);
+    if (b.clients != null) rows.push(`${b.clients} clients`);
+    body = rows.join("<br>");
+  }
+  const inOutage = _load.outages.find((o) => o.start <= t0 + s.width && (o.end ?? s.until) >= t0);
+  if (inOutage) body += `<br><b>Outage: ${esc(inOutage.verdict_label)}</b>`;
+  tip.innerHTML = `<b>${fmtTime(t0)}</b>${body}`;
+  tip.hidden = false;
+  tip.style.left = Math.min(ev.clientX + 12, window.innerWidth - tip.offsetWidth - 8) + "px";
+  tip.style.top = (ev.clientY + 14) + "px";
+});
 
 function renderGateway(st) {
   const u = st.unifi, t = st.tunnel;
@@ -144,6 +259,12 @@ function renderGateway(st) {
       rows.push(["WAN port", `${p.up === false ? "DOWN" : p.up ? "up" : "?"}${p.speed ? " · " + p.speed + " Mbps" : ""}${p.type ? " · " + esc(p.type) : ""}${p.gateway ? " · next hop " + esc(p.gateway) : ""}`]);
     }
     if (u.wan_status) rows.push(["UniFi WAN status", esc(u.wan_status)]);
+    if (u.rx_bps != null) rows.push(["WAN throughput", `${fmtMbps(u.rx_bps)} down / ${fmtMbps(u.tx_bps)} up`]);
+    const sys = [u.cpu != null && `CPU ${Math.round(u.cpu)}%`, u.mem != null && `memory ${Math.round(u.mem)}%`,
+      u.temp != null && `${Math.round(u.temp)}°C`].filter(Boolean);
+    if (sys.length) rows.push(["Gateway load", sys.join(" · ")]);
+    if (u.clients != null) rows.push(["Clients", esc(u.clients)]);
+    if (u.speedtest_down_mbps) rows.push(["Last UniFi speed test", `${Math.round(u.speedtest_down_mbps)} down / ${Math.round(u.speedtest_up_mbps || 0)} up Mbps`]);
     if (u.www_drops != null) rows.push(["UniFi-counted drops", esc(u.www_drops)]);
     const mon = u.unifi_wan_monitor;
     if (mon && typeof mon === "object") {
@@ -207,10 +328,11 @@ async function refresh() {
   refreshing = true;
   try {
     const q = `hours=${hours}`;
-    const [st, tl, outs, alerts, events] = await Promise.all([
+    const [st, tl, outs, alerts, events, ld] = await Promise.all([
       getJSON("/api/status"), getJSON(`/api/timeline?${q}&buckets=${hours <= 1 ? 60 : 120}`),
-      getJSON(`/api/outages?${q}`), getJSON(`/api/unifi_alerts?${q}`), getJSON(`/api/events?${q}`)]);
-    renderHeader(st); renderChecks(st, tl); renderOutages(outs);
+      getJSON(`/api/outages?${q}`), getJSON(`/api/unifi_alerts?${q}`), getJSON(`/api/events?${q}`),
+      getJSON(`/api/load?${q}&buckets=${hours <= 1 ? 60 : 120}`)]);
+    renderHeader(st); renderChecks(st, tl); renderOutages(outs); renderLoad(ld);
     renderGateway(st); renderPath(st); renderAlerts(alerts); renderEvents(events);
   } catch (e) {
     $("#overall").innerHTML = `<span class="dot none"></span>Can't reach monitor: ${esc(e.message)}`;
@@ -223,7 +345,7 @@ async function refresh() {
 const tip = $("#tip");
 document.addEventListener("mousemove", (ev) => {
   const el = ev.target.closest(".strip i");
-  if (!el || !window._tl) { tip.hidden = true; return; }
+  if (!el || !window._tl) { if (!ev.target.closest(".chart .hit")) tip.hidden = true; return; }
   const tl = window._tl, i = Number(el.dataset.i), b = tl.series[el.dataset.c]?.[i];
   const t0 = tl.since + i * tl.width, t1 = t0 + tl.width;
   let body = "No data";

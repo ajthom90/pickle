@@ -108,6 +108,31 @@ from the monitor, which is tracked separately (`target.isp_hop_external`).
 Checks that were already failing in the hour before an outage (an ISP router that never
 answers ping, say) are left out of that outage's verdict.
 
+## Load vs. outages
+
+Every UniFi poll also records his gateway's load: WAN throughput (averaged from the
+gateway's byte counters since the previous poll), CPU, memory, temperature and connected
+clients. The dashboard charts them with outages shaded, and each outage shows the peak
+load in the 10 minutes before it started.
+
+To tell whether load is *linked* to outages, pickle ranks each outage's pre-outage peak
+against every 10-minute stretch on record. If load doesn't matter, about 10% of outages
+land in the busiest 10% by chance. The table reports how many actually did, with a
+binomial test, once there's a day of history and at least 3 outages. What a link would
+mean:
+
+- **CPU or memory high before outages:** the router is struggling. Router fault.
+- **Throughput near the line's speed:** the line is saturated. Latency and loss spike,
+  which can trip UniFi's WAN monitor even though nothing actually dropped. Compare with
+  the external checks.
+- **Linked to throughput, but well below line speed and CPU normal:** outages come at
+  busy times without his line or router being stretched. That points at congestion in
+  the ISP's network at peak hours, which is the ISP's problem, not his router's.
+- **No link:** load isn't a factor; the outage verdicts stand on their own.
+
+Set `unifi.wan_down_mbps` / `wan_up_mbps` to his plan's speeds to show load as a share of
+the line; otherwise UniFi's last speed test is used, if there is one.
+
 ## Exports
 
 Every export takes the range selected in the UI (or `?hours=`, or `?since=&until=` as Unix
@@ -116,6 +141,7 @@ timestamps):
 - `/export/results.csv`, `/export/results.json`: every check result (timestamp, check, path,
   target, success/failure, latency, packet loss, detail). Add `&check=<id>` for one check.
 - `/export/outages.csv`: outage windows with verdict and evidence
+- `/export/load.csv`: gateway load samples (throughput, CPU, memory, temperature, clients)
 - `/export/events.csv`: reboots, IP changes, UniFi alarms, failure traceroutes
 - `/report`: a printable summary to send the ISP (print → save as PDF)
 

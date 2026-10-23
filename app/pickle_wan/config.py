@@ -47,7 +47,11 @@ DEFAULTS = {
         "password": "",
         "site": "default",
         "verify_tls": False,
-        "interval_seconds": 60,
+        "interval_seconds": 30,
+        # His plan's speeds, to show load as a share of the line. 0 = use UniFi's last
+        # speed test if there is one.
+        "wan_down_mbps": 0,
+        "wan_up_mbps": 0,
     },
     "ntfy": {
         "enabled": False,

@@ -40,6 +40,18 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
 
+-- Gateway load, one row per UniFi poll. Rates are bits/s averaged since the previous poll.
+CREATE TABLE IF NOT EXISTS load (
+    ts REAL NOT NULL,
+    rx_bps REAL,
+    tx_bps REAL,
+    cpu REAL,
+    mem REAL,
+    temp REAL,
+    clients INTEGER
+);
+CREATE INDEX IF NOT EXISTS load_ts ON load (ts);
+
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -78,6 +90,10 @@ class DB:
                       json.dumps(data) if data is not None else None, uid))
         return cur.rowcount > 0
 
+    def add_load(self, ts, rx_bps, tx_bps, cpu, mem, temp, clients):
+        self.x("INSERT INTO load (ts, rx_bps, tx_bps, cpu, mem, temp, clients) "
+               "VALUES (?, ?, ?, ?, ?, ?, ?)", (ts, rx_bps, tx_bps, cpu, mem, temp, clients))
+
     def get_kv(self, key, default=None):
         rows = self.q("SELECT value FROM kv WHERE key = ?", (key,))
         return json.loads(rows[0]["value"]) if rows else default
@@ -91,3 +107,4 @@ class DB:
         self.x("DELETE FROM results WHERE ts < ?", (cutoff,))
         self.x("DELETE FROM incidents WHERE end IS NOT NULL AND end < ?", (cutoff,))
         self.x("DELETE FROM events WHERE ts < ?", (cutoff,))
+        self.x("DELETE FROM load WHERE ts < ?", (cutoff,))

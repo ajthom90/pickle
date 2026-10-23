@@ -16,7 +16,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import analysis, config
+from . import analysis, config, load
 from .db import DB
 from .monitor import Monitor
 
@@ -133,10 +133,44 @@ def timeline(hours: float = 24, since: float | None = None, until: float | None 
     return {"since": since, "until": until, "width": width, "buckets": buckets, "series": out}
 
 
+def _capacity():
+    return load.capacity(CFG["unifi"], monitor.unifi.snapshot if monitor.unifi else None)
+
+
+def _outages(since, until):
+    """Outages with the gateway's load just before each one."""
+    return load.before(db, analysis.outages(db, monitor.by_id, since, until), _capacity())
+
+
+_corr_cache = {"at": 0, "value": None}
+
+
+def _correlation():
+    """Load vs outages over all stored history. Expensive-ish, so cached for 5 minutes."""
+    now = time.time()
+    if now - _corr_cache["at"] > 300:
+        outs = analysis.outages(db, monitor.by_id, now - CFG["retention_days"] * 86400, now)
+        _corr_cache.update(at=now, value=load.correlate(db, [o for o in outs if not o["ongoing"]],
+                                                        now))
+    return _corr_cache["value"]
+
+
 @app.get("/api/outages")
 def outages(hours: float = 24, since: float | None = None, until: float | None = None):
     since, until = _range(hours, since, until)
-    return list(reversed(analysis.outages(db, monitor.by_id, since, until)))
+    return list(reversed(_outages(since, until)))
+
+
+@app.get("/api/load")
+def load_api(hours: float = 24, since: float | None = None, until: float | None = None,
+             buckets: int = Query(120, ge=10, le=1000)):
+    since, until = _range(hours, since, until)
+    return {"series": load.series(db, since, until, buckets), "capacity": _capacity(),
+            "outages": [{"start": o["start"], "end": o["end"], "verdict": o["verdict"],
+                         "verdict_label": o["verdict_label"]}
+                        for o in analysis.outages(db, monitor.by_id, since, until)],
+            "correlation": _correlation(),
+            "unifi_enabled": CFG["unifi"]["enabled"]}
 
 
 @app.get("/api/unifi_alerts")
@@ -249,7 +283,18 @@ def export_results_json(hours: float = 24, since: float | None = None,
 
 
 OUTAGE_COLS = ["start_utc", "end_utc", "duration_s", "verdict", "explanation", "failed_checks",
-               "role_failure_rates", "unifi_events"]
+               "role_failure_rates", "unifi_events", "download_mbps_before",
+               "upload_mbps_before", "cpu_pct_before", "mem_pct_before", "temp_c_before",
+               "clients_before"]
+
+
+def _load_cols(o):
+    lb = o.get("load_before") or {}
+    mbps = lambda v: round(v / 1e6, 2) if v is not None else None  # noqa: E731
+    return {"download_mbps_before": mbps(lb.get("rx_bps")),
+            "upload_mbps_before": mbps(lb.get("tx_bps")),
+            "cpu_pct_before": lb.get("cpu"), "mem_pct_before": lb.get("mem"),
+            "temp_c_before": lb.get("temp"), "clients_before": lb.get("clients")}
 
 
 @app.get("/export/outages.csv")
@@ -261,8 +306,27 @@ def export_outages_csv(hours: float = 24 * 7, since: float | None = None,
              "explanation": o["explanation"], "failed_checks": " ".join(o["checks"]),
              "role_failure_rates": json.dumps(o["role_failure"]),
              "unifi_events": " | ".join(f"{_iso(e['ts'])} {e['message']}" for e in o["unifi_events"])}
-            for o in analysis.outages(db, monitor.by_id, since, until))
+            | _load_cols(o)
+            for o in _outages(since, until))
     return _csv_stream(OUTAGE_COLS, rows, f"pickle-outages_{_stamp(since, until)}.csv")
+
+
+@app.get("/export/load.csv")
+def export_load_csv(hours: float = 24 * 7, since: float | None = None,
+                    until: float | None = None):
+    since, until = _range(hours, since, until)
+
+    def num(v, scale=1, nd=2):
+        return round(v / scale, nd) if v is not None else None
+    rows = ({"timestamp_utc": _iso(r["ts"]), "unix_ts": round(r["ts"], 3),
+             "download_mbps": num(r["rx_bps"], 1e6), "upload_mbps": num(r["tx_bps"], 1e6),
+             "cpu_pct": num(r["cpu"]), "mem_pct": num(r["mem"]), "temp_c": num(r["temp"], 1, 1),
+             "clients": r["clients"]}
+            for r in db.conn.execute("SELECT * FROM load WHERE ts >= ? AND ts <= ? ORDER BY ts",
+                                     (since, until)))
+    return _csv_stream(["timestamp_utc", "unix_ts", "download_mbps", "upload_mbps", "cpu_pct",
+                        "mem_pct", "temp_c", "clients"], rows,
+                       f"pickle-load_{_stamp(since, until)}.csv")
 
 
 @app.get("/export/events.csv")
@@ -283,8 +347,9 @@ def export_events_csv(hours: float = 24 * 7, since: float | None = None,
 def report(hours: float = 24 * 7, since: float | None = None, until: float | None = None):
     since, until = _range(hours, since, until)
     e = html.escape
-    outs = analysis.outages(db, monitor.by_id, since, until)
+    outs = _outages(since, until)
     alerts = analysis.unifi_alerts(db, monitor.by_id, since, until)
+    corr = _correlation()
     agg = {r["check_id"]: r for r in db.q(
         "SELECT check_id, COUNT(*) n, SUM(ok) good, AVG(CASE WHEN ok THEN latency_ms END) lat, "
         "AVG(loss) loss FROM results WHERE ts >= ? AND ts <= ? GROUP BY check_id", (since, until))}
@@ -304,7 +369,9 @@ def report(hours: float = 24 * 7, since: float | None = None, until: float | Non
         f"<td class=num>{_fmt_dur(o['duration'])}</td><td><b>{e(o['verdict_label'])}</b></td>"
         f"<td>{e(o['explanation'])}<br><small>Failed: {e(', '.join(o['checks']))}</small>"
         + "".join(f"<br><small>UniFi {_ts(ev['ts'])}: {e(ev['message'])}</small>"
-                  for ev in o["unifi_events"]) + "</td></tr>"
+                  for ev in o["unifi_events"])
+        + (f"<br><small>Load in the 10 min before: {e(_load_text(o['load_before']))}</small>"
+           if o.get("load_before") else "") + "</td></tr>"
         for o in outs) or "<tr><td colspan=5>No outages recorded in this period.</td></tr>"
     alert_rows = "".join(
         f"<tr><td>{_ts(a['ts'])}</td><td>{e(a['message'])}</td><td>"
@@ -312,6 +379,11 @@ def report(hours: float = 24 * 7, since: float | None = None, until: float | Non
            None: "No data"}[a["corroborated"]] + "</td></tr>"
         for a in alerts) or "<tr><td colspan=3>No UniFi WAN alerts in this period.</td></tr>"
     summary = ", ".join(f"{v} × {e(k)}" for k, v in sorted(counts.items(), key=lambda x: -x[1]))
+    load_rows = "".join(
+        f"<tr><td>{e(m['label'])}</td><td class=num>{m['busy']} of {m['outages']}</td>"
+        f"<td class=num>{m['expected']}</td><td>{e(m['explanation'])}</td></tr>"
+        for m in (corr or {}).get("metrics", [])) or (
+        "<tr><td colspan=4>No load data yet (needs the UniFi API).</td></tr>")
 
     return f"""<!doctype html><html><head><meta charset=utf-8>
 <title>Connectivity report</title>
@@ -334,12 +406,35 @@ Every result is timestamped; a failure that hits his WAN IP <i>and</i> the ISP's
 the gateway's uptime is unbroken, places the fault in the ISP network.</p>
 <h2>Outages</h2>
 <table><tr><th>Start (UTC)</th><th>End (UTC)</th><th>Duration</th><th>Verdict</th><th>Evidence</th></tr>{outage_rows}</table>
+<h2>Load vs. outages</h2>
+<p>Gateway load comes from the UniFi API. For each outage, pickle takes the peak of each measure in the 10 minutes
+before it began and ranks it against every 10-minute window on record ({(corr or {}).get('history_hours', 0)} h of history,
+not just this period). If load played no part, about 10% of outages would start in the busiest 10% of windows by chance.</p>
+<table><tr><th>Measure</th><th class=num>Outages in busiest 10%</th><th class=num>Expected by chance</th><th>Finding</th></tr>{load_rows}</table>
 <h2>UniFi WAN alerts vs. external evidence</h2>
 <table><tr><th>Time (UTC)</th><th>UniFi alert</th><th>Confirmed from outside?</th></tr>{alert_rows}</table>
 <h2>Check availability</h2>
 <table><tr><th>Check</th><th>Path</th><th>Target</th><th class=num>Samples</th><th class=num>Success</th><th class=num>Avg ms</th></tr>{check_rows}</table>
 <p class=meta>Raw per-check results for this period: <a href="/export/results.csv?since={since}&until={until}">CSV</a> · <a href="/export/results.json?since={since}&until={until}">JSON</a></p>
 </body></html>"""
+
+
+def _load_text(lb):
+    parts = []
+    for key, label in (("rx_bps", "down"), ("tx_bps", "up")):
+        if lb.get(key) is not None:
+            util = lb.get(key + "_util")
+            parts.append(f"{lb[key] / 1e6:.1f} Mbps {label}"
+                         + (f" ({util * 100:.0f}% of line)" if util is not None else ""))
+    if lb.get("cpu") is not None:
+        parts.append(f"CPU {lb['cpu']:.0f}%")
+    if lb.get("mem") is not None:
+        parts.append(f"memory {lb['mem']:.0f}%")
+    if lb.get("temp") is not None:
+        parts.append(f"{lb['temp']:.0f}°C")
+    if lb.get("clients") is not None:
+        parts.append(f"{lb['clients']:.0f} clients")
+    return ", ".join(parts)
 
 
 def _path_label(c):

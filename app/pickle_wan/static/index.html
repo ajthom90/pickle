@@ -25,6 +25,7 @@
     <a id="x-results-json">Results JSON</a>
     <a id="x-outages-csv">Outages CSV</a>
     <a id="x-events-csv">Events CSV</a>
+    <a id="x-load-csv">Load CSV</a>
     <a id="x-report" target="_blank">Report for ISP</a>
   </div>
 </div>
@@ -50,6 +51,14 @@
     <h2>Outages <span class="muted" id="outage-count"></span></h2>
     <p class="hint">Each window where his WAN, his internet access, or DNS failed, with a verdict based on which layers failed together.</p>
     <div class="table-wrap"><table id="outages"><thead><tr><th>Start</th><th>Duration</th><th>Verdict</th><th>Why</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section class="card" id="load-card">
+    <h2>Load vs. outages</h2>
+    <p class="hint">His gateway's load from the UniFi API. Shaded bands are outages. The table checks whether outages tend to start when the connection is busy.</p>
+    <div id="load-charts"></div>
+    <div class="table-wrap"><table id="load-corr"><thead><tr><th>Measure</th><th class="num">Outages at peak load</th><th class="num">Expected by chance</th><th>Finding</th></tr></thead><tbody></tbody></table></div>
+    <p class="hint" id="load-note"></p>
   </section>
 
   <div class="two">

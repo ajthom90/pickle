@@ -41,7 +41,11 @@ unifi:
   password: ""
   site: default
   verify_tls: false            # the gateway uses a self-signed certificate
-  interval_seconds: 60
+  interval_seconds: 30         # also how often load (throughput, CPU, clients) is sampled
+  # His plan's speeds, to show load as a share of the line. 0 = use UniFi's last
+  # speed test result, if it has one.
+  wan_down_mbps: 0
+  wan_up_mbps: 0
 
 # Push notifications through ntfy (ntfy.sh or your own server). You get one message
 # when an outage starts and one when it ends, with the verdict.
