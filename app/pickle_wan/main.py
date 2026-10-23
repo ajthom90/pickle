@@ -215,7 +215,9 @@ def events(hours: float = 24, since: float | None = None, until: float | None = 
             # Plain router log lines are many; they're shown with each outage instead.
             for r in db.q("SELECT ts, source, kind, message, data FROM events "
                           "WHERE ts >= ? AND ts <= ? AND NOT (source = 'router_log' "
-                          "AND kind IN ('log', 'link_up', 'link_down', 'dhcpv6_probe')) "
+                          "AND kind IN ('log', 'link_up', 'link_down', 'dhcpv6_probe', 'dhcp_renew', "
+                          "'dhcp_lease', 'dhcp_select', 'dhcp_offer', 'dhcp_discover', "
+                          "'dhcp_client_start', 'dhcp_client_stop')) "
                           "ORDER BY ts DESC LIMIT 500", (since, until))]
 
 

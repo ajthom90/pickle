@@ -464,12 +464,18 @@ def router_log_context(db, start, end, ongoing, rebooted=False):
     lines = [r for r in rows if not r["data"].get("clock_suspect")]
 
     def shown(r):
-        # other interfaces' link lines and Wi-Fi carrier noise aren't about his WAN
-        if r["kind"] in ("link_up", "link_down"):
+        """Only lines about his WAN. The router's log also holds the LAN's DHCP server, Wi-Fi
+        client tracking and device names, which don't belong in an ISP ticket."""
+        k = r["kind"]
+        if k.startswith("dhcp_") or k in ("wan_monitor", "wan_state", "dhcpv6_probe", "reset_button"):
+            return True
+        if k in ("link_up", "link_down"):
             return r["data"].get("iface") == wan
-        if r["kind"] == "log" and re.search(r"carrier|Link is", r["message"]):
-            return False
-        return True
+        if k == "log" and wan:
+            text = r["data"].get("text") or ""
+            return bool(re.search(rf"\b{re.escape(wan)}\b|udhcpc-{re.escape(wan)}", text)) \
+                and not re.search(r"dnsmasq|stahtd|DHCP-SM|carrier|Link is", r["message"])
+        return False
     covered = router_log_covers(db, start, end, ongoing, rebooted)
     ctx = {"lines": [{"ts": r["ts"], "kind": r["kind"], "message": r["message"]}
                      for r in lines if shown(r)],

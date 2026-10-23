@@ -377,8 +377,25 @@ class RouterLog:
             self._set("error", f"{type(e).__name__}: {e.reason}")
 
     async def _run(self, conn, name):
-        r = await conn.run(COMMANDS[name], check=False, timeout=120)
-        return r.stdout or ""
+        # Log files can hold stray bytes (wan-diag-port.log does; so can lines next to a power
+        # cut): decode with replacement and drop NUL padding rather than failing the read.
+        r = await conn.run(COMMANDS[name], check=False, timeout=120, encoding="utf-8", errors="replace")
+        return (r.stdout or "").replace("\x00", "")
+
+    async def _read_one(self, conn, name, backfill_key, store, problems):
+        """One log read, isolated: a failure is reported but doesn't stop the other reads.
+        Each source has its own backfill flag, set only once its backfill succeeded."""
+        backfill = backfill_key and not self.db.get_kv(backfill_key)
+        cmd = name + ("_backfill" if backfill else "")
+        try:
+            out = await self._run(conn, cmd)
+        except (asyncio.TimeoutError, asyncssh.Error, OSError) as e:
+            problems.append(f"{name}: {type(e).__name__}")
+            return 0
+        new = await asyncio.to_thread(store, out.splitlines())
+        if backfill:
+            self.db.set_kv(backfill_key, time.time())
+        return new
 
     async def _read(self, conn):
         clock = (await self._run(conn, "clock")).splitlines()
@@ -391,26 +408,23 @@ class RouterLog:
         boot = router_now - float(uptime) if uptime and _isfloat(uptime) else None
 
         available = (await self._run(conn, "probe")).split()
-        backfill = not self.db.get_kv(BACKFILL_FLAG)
-        suffix = "_backfill" if backfill else ""
-        new = 0
+        lines_store = lambda lines: self.store(lines, tz, router_now, boot)  # noqa: E731
+        new, problems = 0, []
         if "unifi" in available:
             source = "UniFi OS logs"
             for name in UNIFI_READS:
-                new += self.store((await self._run(conn, name + suffix)).splitlines(),
-                                  tz, router_now, boot)
-            new += self.store_reboot_records((await self._run(conn, "unifi_reboots")).splitlines())
+                new += await self._read_one(conn, name, f"{BACKFILL_FLAG}:{name}", lines_store, problems)
+            new += await self._read_one(conn, "unifi_reboots", None, self.store_reboot_records, problems)
         else:
             source = next((s for s in SOURCES if s in available), None)
             if not source:
                 self._set("connected", "no /var/log/messages, logread or journalctl on the router")
                 self.status["last_ok"] = time.time()
                 return
-            new = self.store((await self._run(conn, source + suffix)).splitlines(), tz, router_now, boot)
-        if backfill:
-            self.db.set_kv(BACKFILL_FLAG, time.time())
+            new = await self._read_one(conn, source, f"{BACKFILL_FLAG}:{source}", lines_store, problems)
         self.status.update(source=source, new_lines=new, last_ok=time.time())
-        self._set("connected", f"{new} new line(s) from {source}")
+        self._set("connected", f"{new} new line(s) from {source}"
+                  + (f"; couldn't read {', '.join(problems)}" if problems else ""))
 
     def store_reboot_records(self, lines):
         """UniFi OS's reboot-time.log: when and how the router last restarted. Its time is when
@@ -442,7 +456,7 @@ class RouterLog:
         new, latest = 0, None
         wan_iface = self.db.get_kv("router_wan_iface")
         for line in lines:
-            line = line.rstrip()
+            line = line.replace("\x00", "").strip()
             if not line:
                 continue
             parsed = parse_line(line, tz, router_now)
