@@ -283,9 +283,33 @@ def export_results_json(hours: float = 24, since: float | None = None,
 
 
 OUTAGE_COLS = ["start_utc", "end_utc", "duration_s", "verdict", "explanation", "failed_checks",
-               "role_failure_rates", "unifi_events", "download_mbps_before",
+               "role_failure_rates", "unifi_events", "lease_obtained_utc", "lease_time_s",
+               "lease_expires_utc", "lease_due_in_window", "lease_note", "after_recovery_utc",
+               "after_recovery_wan_ip", "after_recovery_gateway", "after_recovery_wan_port",
+               "after_recovery_lease", "download_mbps_before",
                "upload_mbps_before", "cpu_pct_before", "mem_pct_before", "temp_c_before",
                "clients_before"]
+
+
+def _lease_cols(o):
+    lease, rec = o.get("lease") or {}, o.get("recovery") or {}
+    rl = rec.get("lease") or {}
+    port = rec.get("wan_port") or {}
+    return {
+        "lease_obtained_utc": _iso(lease.get("obtained")),
+        "lease_time_s": round(lease["lease_time"]) if lease.get("lease_time") else None,
+        "lease_expires_utc": _iso(lease.get("expires")),
+        "lease_due_in_window": " | ".join(f"{d['what']} {_iso(d['at'])}"
+                                          for d in lease.get("due", [])),
+        "lease_note": lease.get("note", ""),
+        "after_recovery_utc": _iso(rec.get("ts")),
+        "after_recovery_wan_ip": rec.get("wan_ip"),
+        "after_recovery_gateway": rec.get("isp_gateway"),
+        "after_recovery_wan_port": " ".join(f"{k}={v}" for k, v in port.items()),
+        "after_recovery_lease": " ".join(
+            f"{k}={_iso(rl[k]) if k != 'lease_time' else round(rl[k])}"
+            for k in ("obtained", "expires", "lease_time") if rl.get(k)),
+    }
 
 
 def _load_cols(o):
@@ -306,7 +330,7 @@ def export_outages_csv(hours: float = 24 * 7, since: float | None = None,
              "explanation": o["explanation"], "failed_checks": " ".join(o["checks"]),
              "role_failure_rates": json.dumps(o["role_failure"]),
              "unifi_events": " | ".join(f"{_iso(e['ts'])} {e['message']}" for e in o["unifi_events"])}
-            | _load_cols(o)
+            | _lease_cols(o) | _load_cols(o)
             for o in _outages(since, until))
     return _csv_stream(OUTAGE_COLS, rows, f"pickle-outages_{_stamp(since, until)}.csv")
 
@@ -370,6 +394,10 @@ def report(hours: float = 24 * 7, since: float | None = None, until: float | Non
         f"<td>{e(o['explanation'])}<br><small>Failed: {e(', '.join(o['checks']))}</small>"
         + "".join(f"<br><small>UniFi {_ts(ev['ts'])}: {e(ev['message'])}</small>"
                   for ev in o["unifi_events"])
+        + (f"<br><small>DHCP lease: {e(o['lease']['note'])}</small>"
+           if o.get("lease") and o["lease"]["note"] not in o["explanation"] else "")
+        + (f"<br><small>Right after recovery: {e(_recovery_text(o['recovery']))}</small>"
+           if o.get("recovery") else "")
         + (f"<br><small>Load in the 10 min before: {e(_load_text(o['load_before']))}</small>"
            if o.get("load_before") else "") + "</td></tr>"
         for o in outs) or "<tr><td colspan=5>No outages recorded in this period.</td></tr>"
@@ -403,7 +431,9 @@ th{{background:#f3f2ee}} .num{{text-align:right;font-variant-numeric:tabular-num
 plus control hosts to prove the monitor's own connection was healthy. Through a WireGuard tunnel to his gateway,
 it also probes internet hosts and DNS <i>from his connection</i>, and reads the gateway's uptime, WAN port state and event log.
 Every result is timestamped; a failure that hits his WAN IP <i>and</i> the ISP's upstream router at the same time, while
-the gateway's uptime is unbroken, places the fault in the ISP network.</p>
+the gateway's uptime is unbroken, places the fault in the ISP network. When his WAN stops answering while
+the ISP's gateway still does, his router's link stays up, and service returns only when the router makes a fresh DHCP
+request (reconnecting the cable or renewing its lease), the ISP had stopped serving his router's existing session.</p>
 <h2>Outages</h2>
 <table><tr><th>Start (UTC)</th><th>End (UTC)</th><th>Duration</th><th>Verdict</th><th>Evidence</th></tr>{outage_rows}</table>
 <h2>Load vs. outages</h2>
@@ -417,6 +447,28 @@ not just this period). If load played no part, about 10% of outages would start 
 <table><tr><th>Check</th><th>Path</th><th>Target</th><th class=num>Samples</th><th class=num>Success</th><th class=num>Avg ms</th></tr>{check_rows}</table>
 <p class=meta>Raw per-check results for this period: <a href="/export/results.csv?since={since}&until={until}">CSV</a> · <a href="/export/results.json?since={since}&until={until}">JSON</a></p>
 </body></html>"""
+
+
+def _recovery_text(rec):
+    """One line describing his gateway's WAN state at the first poll after an outage."""
+    parts = [f"{_ts(rec['ts'])} UTC"]
+    if rec.get("wan_ip"):
+        parts.append(f"WAN IP {rec['wan_ip']}")
+    if rec.get("isp_gateway"):
+        parts.append(f"gateway {rec['isp_gateway']}")
+    port = rec.get("wan_port") or {}
+    if "up" in port:
+        parts.append("WAN port " + ("up" if port["up"] else "DOWN"))
+    if rec.get("wan_uptime") is not None:
+        parts.append(f"WAN up {_fmt_dur(rec['wan_uptime'])}")
+    lease = rec.get("lease") or {}
+    if lease.get("obtained"):
+        parts.append(f"lease obtained {_ts(lease['obtained'])} UTC")
+    if lease.get("lease_time"):
+        parts.append(f"lease time {_fmt_dur(lease['lease_time'])}")
+    if not lease:
+        parts.append("lease details not reported")
+    return ", ".join(parts)
 
 
 def _load_text(lb):

@@ -65,6 +65,14 @@ ntfy:
   priority_up: default
   ignore_verdicts: []          # e.g. [tunnel, monitor] to skip VPN-only and monitor-side outages
   click_url: ""                # opened when you tap the notification, e.g. http://docker-host:8080
+  # The "outage started" message ends with an on-site checklist (photograph the ONT, ping
+  # the ISP gateway and check `ip neigh` on the router, then re-plug only the WAN cable).
+  # {isp_gateway} becomes his WAN's default gateway. Uncomment to change it, or set it to
+  # "" to leave it out.
+  # onsite_note: |
+  #   On site, before touching anything:
+  #   1. Photograph the ONT (Network Status light, ETH1 lights).
+  #   2. ...
 
 # Extra checks (same shape as the built-in ones). via: external | vpn,
 # type: ping | tcp | dns | http, role: see app/pickle_wan/config.py.

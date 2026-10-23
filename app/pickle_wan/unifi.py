@@ -2,7 +2,10 @@
 
 Collects what the gateway itself knows: its uptime (to catch reboots), the WAN
 port state and IP, UniFi's own WAN-monitor stats and drop counter, its
-alarm/event log, and its load (WAN throughput, CPU, memory, temperature, clients). Endpoint shapes differ between UniFi Network versions, so every
+alarm/event log, its load (WAN throughput, CPU, memory, temperature, clients),
+and whatever DHCP lease details the firmware exposes. After the gateway has been
+unreachable (usually an outage, since the tunnel runs over his line), the first
+successful poll is saved as a recovery snapshot. Endpoint shapes differ between UniFi Network versions, so every
 piece is optional; whatever came back raw is viewable at /api/unifi/raw.
 """
 import logging
@@ -15,6 +18,16 @@ log = logging.getLogger("pickle.unifi")
 
 GATEWAY_TYPES = {"udm", "ugw", "uxg", "udr"}
 WAN_WORDS = re.compile(r"wan|internet|isp|uplink", re.I)
+
+# DHCP lease details aren't documented and vary by firmware, so pickle collects every field
+# whose name looks lease-related (shown raw on the dashboard and in /api/unifi/raw) and only
+# interprets values whose meaning is unambiguous: epoch timestamps and plausible durations.
+LEASE_NAME = re.compile(r"lease|dhcp|expir|obtain|acquir|renew|rebind", re.I)
+LEASE_OBTAINED = re.compile(r"obtain|acquir|lease_?start|renewed|bound", re.I)
+LEASE_EXPIRES = re.compile(r"expir", re.I)
+LEASE_RELATIVE = re.compile(r"remain|left|_in$|ttl", re.I)
+LEASE_DURATION = re.compile(r"lease.*(time|duration|secs?|length|period)$", re.I)
+MAX_LEASE = 30 * 86400
 
 
 class UniFi:
@@ -29,6 +42,9 @@ class UniFi:
         self._cookies = None
         self._counters = None    # (ts, rx_bytes, tx_bytes) from the previous poll
         self._integration = {}
+        # Last successful poll in this process. Not persisted: after a restart, the gap is
+        # pickle's own downtime, which says nothing about whether his gateway was reachable.
+        self._last_ok = None
 
     def _client(self):
         headers = {"Accept": "application/json"}
@@ -83,8 +99,10 @@ class UniFi:
         snap = {"polled_at": time.time()}
         rates = (None, None)
         counters = (None, None)
+        lease_fields = {}
         for sub in _data(health):
             if sub.get("subsystem") == "wan":
+                lease_fields.update(_lease_fields(sub, "health.wan"))
                 snap["wan_status"] = sub.get("status")
                 snap["wan_ip"] = sub.get("wan_ip")
                 snap["isp_name"] = sub.get("isp_name") or sub.get("isp_organization")
@@ -114,6 +132,10 @@ class UniFi:
                 if dev.get("uptime"):
                     snap["uptime"] = int(dev["uptime"])
                 wan1 = dev.get("wan1") or {}
+                for prefix, obj in (("device", dev), ("wan1", wan1), ("uplink", dev.get("uplink"))):
+                    lease_fields.update(_lease_fields(obj, prefix))
+                if _num(wan1.get("uptime")) is not None:
+                    snap["wan_uptime"] = int(_num(wan1["uptime"]))
                 snap["wan_port"] = {k: wan1.get(k) for k in
                                     ("up", "ip", "gateway", "type", "speed", "full_duplex", "name")
                                     if k in wan1}
@@ -142,8 +164,13 @@ class UniFi:
                 rates = (i["rx_bps"] / 8, (i.get("tx_bps") or 0) / 8)
         if not snap.get("uptime"):
             snap.pop("uptime", None)
+        if lease_fields:
+            snap["lease_fields"] = lease_fields
+            snap["lease"] = interpret_lease(lease_fields, snap["polled_at"])
         self._record_load(snap, counters, rates)
         self._track(snap)
+        self._track_lease(snap)
+        self._recovery(snap)
         self._ingest(_data(alarms), "alarm")
         self._ingest(_data(events), "event")
         self.snapshot = snap
@@ -230,6 +257,50 @@ class UniFi:
                                   data={"up": port["up"], "since": prev_ts, "seen": now})
             self.db.set_kv("gw_wan_up", {"up": port["up"], "ts": now})
 
+    def _track_lease(self, snap):
+        """Log an event when the lease is first seen, renewed, or its length changes. These
+        events are the lease history outages are compared against."""
+        lease = snap.get("lease")
+        if not lease or not (lease.get("obtained") or lease.get("expires")):
+            return
+        prev = self.db.get_kv("gw_lease") or {}
+        data = {k: lease.get(k) for k in ("obtained", "expires", "lease_time", "sources")}
+        anchor = lease.get("obtained") or lease.get("expires")
+        if not prev:
+            kind, msg = "dhcp_lease", "DHCP lease first seen"
+        elif (lease.get("obtained") and prev.get("obtained")
+              and lease["obtained"] - prev["obtained"] > 30) or (
+                lease.get("expires") and prev.get("expires")
+                and lease["expires"] - prev["expires"] > 60):
+            kind, msg = "dhcp_lease", "DHCP lease renewed"
+        elif lease.get("lease_time") != prev.get("lease_time") and lease.get("lease_time"):
+            kind, msg = "dhcp_lease", f"DHCP lease time changed to {_dur(lease['lease_time'])}"
+        else:
+            self.db.set_kv("gw_lease", data)
+            return
+        if lease.get("lease_time"):
+            msg += f" (lease {_dur(lease['lease_time'])})"
+        self.db.add_event("unifi", kind, msg, data=data, ts=lease.get("obtained") or snap["polled_at"],
+                          uid=f"lease:{int(anchor)}:{lease.get('lease_time')}")
+        self.db.set_kv("gw_lease", data)
+
+    def _recovery(self, snap):
+        """The first poll after the gateway was unreachable: keep what its WAN looked like
+        right after recovery, since nothing could be read during the outage."""
+        now = snap["polled_at"]
+        gap = max(3 * self.cfg["interval_seconds"], 90)
+        if self._last_ok and now - self._last_ok > gap:
+            data = {"unreachable_since": self._last_ok, "seen": now}
+            for k in ("wan_ip", "isp_gateway", "wan_port", "wan_uptime", "uptime", "lease",
+                      "lease_fields", "wan_status"):
+                if snap.get(k) is not None:
+                    data[k] = snap[k]
+            self.db.add_event("unifi", "recovery",
+                              f"Gateway reachable again after {_dur(now - self._last_ok)}; "
+                              f"WAN IP {snap.get('wan_ip') or 'unknown'}",
+                              data=data, ts=now, uid=f"recovery:{int(now)}")
+        self._last_ok = now
+
     def _ingest(self, items, kind):
         for it in items:
             uid = it.get("_id")
@@ -252,6 +323,58 @@ def _data(body):
         d = body.get("data")
         return d if isinstance(d, list) else []
     return body if isinstance(body, list) else []
+
+
+def _lease_fields(obj, prefix, depth=0):
+    """Scalar fields whose name looks lease-related, keyed by their path."""
+    out = {}
+    if not isinstance(obj, dict) or depth > 2:
+        return out
+    for k, v in obj.items():
+        path = f"{prefix}.{k}"
+        if isinstance(v, dict):
+            out.update(_lease_fields(v, path, depth + 1))
+        elif LEASE_NAME.search(str(k)) and isinstance(v, (int, float, str, bool)):
+            out[path] = v
+    return out
+
+
+def _epoch(v, now):
+    n = _num(v)
+    if n is None:
+        return None
+    if n > 1e12:
+        n /= 1000
+    return n if abs(n - now) < 400 * 86400 else None
+
+
+def interpret_lease(fields, now):
+    """What the lease fields unambiguously say: obtained / expires (epoch seconds) and
+    lease_time (seconds). Anything else stays raw. `sources` names the field behind each."""
+    out, src = {}, {}
+    for path, v in fields.items():
+        name = path.rsplit(".", 1)[-1]
+        n = _num(v)
+        if n is None:
+            continue
+        ep = _epoch(v, now)
+        if LEASE_EXPIRES.search(name):
+            if ep:
+                out.setdefault("expires", ep); src.setdefault("expires", path)
+            elif LEASE_RELATIVE.search(name) and 0 <= n <= MAX_LEASE:
+                out.setdefault("expires", now + n); src.setdefault("expires", path)
+        elif LEASE_OBTAINED.search(name) and ep:
+            out.setdefault("obtained", ep); src.setdefault("obtained", path)
+        elif LEASE_DURATION.search(name) and not ep and 60 <= n <= MAX_LEASE:
+            out.setdefault("lease_time", n); src.setdefault("lease_time", path)
+    if out.get("obtained") and out.get("lease_time") and not out.get("expires"):
+        out["expires"] = out["obtained"] + out["lease_time"]
+    if out.get("expires") and out.get("lease_time") and not out.get("obtained"):
+        out["obtained"] = out["expires"] - out["lease_time"]
+    if not out:
+        return None
+    out["sources"] = src
+    return out
 
 
 def _num(v):

@@ -21,7 +21,8 @@ gets a verdict based on which layers failed together:
 | Control hosts failed too | **Inconclusive.** The monitor's own internet was down |
 | Gateway uptime reset during the window | **Router.** It rebooted |
 | His WAN *and* the ISP's upstream router both unreachable | **ISP network** |
-| His WAN unreachable, ISP's upstream router fine, no reboot | **Last mile / WAN link**: fiber, ONT, or ISP session (DHCP/PPPoE). A UniFi "WAN port DOWN" event points at the ONT |
+| His WAN unreachable, ISP's gateway answering, no reboot, his WAN link stayed up (or only dropped late, i.e. someone reconnecting), and service came back when the link was reconnected or the DHCP lease renewed | **ISP session / DHCP**: the line and ONT work, but the ISP stopped serving his router's existing session until a fresh DHCP exchange |
+| His WAN unreachable, ISP's upstream router fine, no reboot, otherwise | **Last mile / WAN link**: the fiber, the ONT, or a port actually dropping. A UniFi "WAN port DOWN" at the start points at the ONT |
 | WAN reachable from outside, but his router couldn't reach the internet | **ISP upstream routing** |
 | Only VPN checks failed | **VPN tunnel only.** Not an internet outage |
 | Only DNS failed | **DNS only** |
@@ -33,6 +34,21 @@ ICMP, so an uncorroborated alert is worth knowing about.
 > **Limitation:** when his internet is down, the WireGuard tunnel is down too. Hard outages are
 > diagnosed from the outside checks plus what the gateway reports once it's reachable again
 > (uptime, WAN port events, alarms). The tunnel checks catch the partial failures in between.
+
+### DHCP lease and recovery evidence
+
+Each outage also shows where it fell relative to his router's **DHCP lease**: how long after
+the lease was obtained, and whether a renewal (T/2), rebind (7T/8) or expiry was due during or
+just before it. If it lines up with a renewal, the explanation says so. UniFi doesn't document
+lease fields and they vary by firmware, so pickle collects every lease-looking field it finds
+(shown raw on the dashboard and at `/api/unifi/raw`). It only interprets epoch timestamps
+and plausible durations. When nothing is exposed, outages say "lease timing unknown". Lease
+renewals are logged as events.
+
+The first UniFi poll after the gateway becomes reachable again is saved as a **recovery
+snapshot**, attached to the outage: WAN IP, gateway, WAN port, lease details, and WAN uptime
+if reported. It's the closest pickle can get to the router's state during the outage, since
+the tunnel was down.
 
 ## Setup
 
@@ -140,7 +156,8 @@ timestamps):
 
 - `/export/results.csv`, `/export/results.json`: every check result (timestamp, check, path,
   target, success/failure, latency, packet loss, detail). Add `&check=<id>` for one check.
-- `/export/outages.csv`: outage windows with verdict and evidence
+- `/export/outages.csv`: outage windows with verdict and evidence, DHCP lease timing, and
+  the gateway's WAN state right after recovery
 - `/export/load.csv`: gateway load samples (throughput, CPU, memory, temperature, clients)
 - `/export/events.csv`: reboots, IP changes, UniFi alarms, failure traceroutes
 - `/report`: a printable summary to send the ISP (print → save as PDF)
@@ -158,6 +175,12 @@ sends two messages:
   failing checks and an early verdict.
 - **Resolved**, a minute after it ends (so a flapping line doesn't send a pair per flap),
   with the duration and the final verdict and explanation.
+
+The started message ends with an on-site checklist for whoever is at the house:
+photograph the ONT, ping the ISP gateway and check `ip neigh` on the router (a FAILED or
+INCOMPLETE entry for the gateway means the ISP side stopped answering), then re-plug only
+the router's WAN cable and note the time. Change it with `onsite_note` (`{isp_gateway}` is
+filled in), or set `onsite_note: ""` to leave it out.
 
 Shorter outages send nothing. What's been sent is stored in the database, so a restart
 doesn't repeat it. `ignore_verdicts` skips outages you don't care about, e.g.

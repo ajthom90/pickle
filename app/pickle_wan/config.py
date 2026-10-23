@@ -68,6 +68,14 @@ DEFAULTS = {
         "priority_up": "default",
         "ignore_verdicts": [],
         "click_url": "",
+        # Appended to the "outage started" message for whoever is on site. {isp_gateway} is
+        # replaced with his WAN's default gateway. Set to "" to leave it out.
+        "onsite_note": (
+            "On site, before touching anything:\n"
+            "1. Photograph the ONT (Network Status light, ETH1 lights).\n"
+            "2. If you can, SSH to the router and run `ping {isp_gateway}` and `ip neigh`; "
+            "note whether {isp_gateway} shows FAILED or INCOMPLETE.\n"
+            "3. Then re-plug only the router's WAN cable and note the time."),
     },
     "checks": None,
     "extra_checks": [],
@@ -121,6 +129,10 @@ def load(path=CONFIG_PATH):
             raise SystemExit("config: ntfy.topic is required when ntfy is enabled")
         if not n["server"].startswith(("http://", "https://")):
             raise SystemExit("config: ntfy.server must start with http:// or https://")
+        if n["onsite_note"] is None:
+            n["onsite_note"] = ""
+        if not isinstance(n["onsite_note"], str):
+            raise SystemExit("config: ntfy.onsite_note must be text (or \"\" to leave it out)")
         unknown = set(n["ignore_verdicts"] or []) - set(VERDICTS)
         if unknown:
             raise SystemExit(f"config: ntfy.ignore_verdicts has unknown verdicts {sorted(unknown)}")

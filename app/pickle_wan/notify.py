@@ -75,6 +75,13 @@ class Ntfy:
             return False, detail
         return True, "sent"
 
+    def onsite_note(self, monitor):
+        note = (self.cfg.get("onsite_note") or "").strip()
+        if not note:
+            return ""
+        gw = monitor.resolve_target("{isp_gateway}") or "the ISP gateway"
+        return "\n\n" + note.replace("{isp_gateway}", gw)
+
     # ---- outage notifications -----------------------------------------------
 
     async def run(self, monitor):
@@ -116,7 +123,8 @@ class Ntfy:
                         f"Outage at {self.wan_host}",
                         f"Failing: {names}\n"
                         f"Down {_duration(o['duration'])} so far. "
-                        f"Early read: {o['verdict_label']} (final verdict comes when it ends).",
+                        f"Early read: {o['verdict_label']} (final verdict comes when it ends)."
+                        + self.onsite_note(monitor),
                         self.cfg["priority_down"], ["rotating_light"])
                     if ok:
                         sent[key] = {"started": True, "ts": now}

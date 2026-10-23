@@ -17,7 +17,7 @@ const STATUS = {
   critical: { label: "Down", icon: "✕" },
   none: { label: "Waiting", icon: "…" },
 };
-const VERDICT_STATUS = { isp: "critical", last_mile: "critical", upstream: "critical",
+const VERDICT_STATUS = { isp: "critical", last_mile: "critical", upstream: "critical", isp_session: "critical",
   router: "warning", dns: "warning", tunnel: "none", monitor: "none", unknown: "none" };
 
 const fmtTime = (ts) => new Date(ts * 1000).toLocaleString([], { month: "short", day: "numeric",
@@ -125,11 +125,26 @@ function renderOutages(list) {
       <td>${badge(VERDICT_STATUS[o.verdict] || "none", o.verdict_label)}</td>
       <td class="why">${esc(o.explanation)}<br><span class="muted">Failed: ${esc(o.checks.join(", "))}</span>${
         o.unifi_events.map((e) => `<br><span class="muted">UniFi ${fmtTime(e.ts)}: ${esc(e.message)}</span>`).join("")}${
+        o.lease && !o.explanation.includes(o.lease.note) ? `<br><span class="muted">DHCP lease: ${esc(o.lease.note)}</span>` : ""}${
+        o.recovery ? `<br><span class="muted">Right after recovery: ${esc(recoveryText(o.recovery))}</span>` : ""}${
         o.load_before ? `<br><span class="muted">10 min before: ${esc(loadText(o.load_before))}</span>` : ""}</td>
     </tr>`).join("") || `<tr><td colspan="4" class="muted">No outages in this range.</td></tr>`;
 }
 
 const fmtMbps = (bps) => bps == null ? "–" : (bps / 1e6 >= 100 ? (bps / 1e6).toFixed(0) : (bps / 1e6).toFixed(1)) + " Mbps";
+
+function recoveryText(r) {
+  const parts = [fmtTime(r.ts)];
+  if (r.wan_ip) parts.push(`WAN IP ${r.wan_ip}`);
+  if (r.isp_gateway) parts.push(`gateway ${r.isp_gateway}`);
+  if (r.wan_port && "up" in r.wan_port) parts.push(`WAN port ${r.wan_port.up ? "up" : "DOWN"}`);
+  if (r.wan_uptime != null) parts.push(`WAN up ${fmtDur(r.wan_uptime)}`);
+  const l = r.lease || {};
+  if (l.obtained) parts.push(`lease obtained ${fmtTime(l.obtained)}`);
+  if (l.lease_time) parts.push(`lease time ${fmtDur(l.lease_time)}`);
+  if (!r.lease) parts.push("lease details not reported");
+  return parts.join(", ");
+}
 
 function loadText(lb) {
   const parts = [];
@@ -264,6 +279,17 @@ function renderGateway(st) {
       u.temp != null && `${Math.round(u.temp)}°C`].filter(Boolean);
     if (sys.length) rows.push(["Gateway load", sys.join(" · ")]);
     if (u.clients != null) rows.push(["Clients", esc(u.clients)]);
+    if (u.lease) {
+      const l = u.lease, bits = [];
+      if (l.obtained) bits.push(`obtained ${fmtTime(l.obtained)}`);
+      if (l.lease_time) bits.push(`lease ${fmtDur(l.lease_time)}`);
+      if (l.obtained && l.lease_time) bits.push(`renews ${fmtTime(l.obtained + l.lease_time / 2)}`);
+      if (l.expires) bits.push(`expires ${fmtTime(l.expires)}`);
+      rows.push(["DHCP lease", esc(bits.join(" · "))]);
+    }
+    if (u.lease_fields) rows.push(["Lease fields (raw)", `<span class="muted">${esc(Object.entries(u.lease_fields).map(([k, v]) => `${k}=${v}`).join(", "))}</span>`]);
+    else if (u.polled_at) rows.push(["DHCP lease", `<span class="muted">not reported by this firmware</span>`]);
+    if (u.wan_uptime != null) rows.push(["WAN uptime", fmtDur(u.wan_uptime)]);
     if (u.speedtest_down_mbps) rows.push(["Last UniFi speed test", `${Math.round(u.speedtest_down_mbps)} down / ${Math.round(u.speedtest_up_mbps || 0)} up Mbps`]);
     if (u.www_drops != null) rows.push(["UniFi-counted drops", esc(u.www_drops)]);
     const mon = u.unifi_wan_monitor;
