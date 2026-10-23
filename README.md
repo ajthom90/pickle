@@ -224,9 +224,11 @@ and common dhclient lines become structured events. Lease lines feed the lease t
 above. Each outage then lists the router's lines from 10 minutes before it to its end,
 and calls out:
 
-- **Renewal sent, no reply until the outage ended**: points at the ISP's DHCP server. It
-  only says this when the log demonstrably covers the outage: there are lines after it,
-  and no reboot inside it. Otherwise it says the reply can't be confirmed.
+- **Renewal sent while traffic was still flowing, no reply until the outage ended**: points
+  at the ISP's DHCP server. It only says this when the log demonstrably covers the outage:
+  there are lines before and after it, and no reboot inside it. Otherwise it says the reply
+  can't be confirmed. Renewals sent *during* an outage are listed but not counted as
+  evidence: once the line is down, nothing gets a reply, whatever the cause.
 - **Renewal answered, then traffic stopped**: the router held a valid lease, so it points
   at the router or the ISP's session, not the DHCP exchange.
 - **No DHCP activity during the outage**: the router still considered its lease valid.
@@ -241,9 +243,11 @@ and set a password. Then set `ssh.enabled: true` and either `SSH_PASSWORD` in th
 file or `ssh.key_file` pointing at a private key in the config folder, which is mounted
 read-only.
 
-**Host key.** On first connect pickle pins the router's SSH host key and shows its
-fingerprint. Compare it with the router's own (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`
-on the router). If the key ever changes, pickle refuses to connect *before* sending the
+**Host key.** On first connect pickle pins the router's SSH host key and shows its type
+and fingerprint in the gateway panel. Check it from a trusted machine on his LAN, which works
+whatever SSH server the router runs: `ssh-keyscan -t ed25519 <router-ip> | ssh-keygen -lf -`.
+Or compare it with the fingerprint `ssh` shows the first time you log in to the router
+yourself. Make sure the key types match. If the key ever changes, pickle refuses to connect *before* sending the
 password, and shows "host key mismatch". If the router was reset or replaced, put its new
 key in `ssh.host_key`.
 

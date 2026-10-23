@@ -78,9 +78,10 @@ def router_tz(zone_name, offset):
     return datetime.timezone.utc
 
 
-def parse_line(line, tz, router_now):
+def parse_line(line, tz, router_now, fold=0):
     """(epoch, program, text) for one log line, or None if it can't be placed in time.
-    Lines without a year get the year that puts them at or before the router's clock."""
+    Lines without a year get the year that puts them at or before the router's clock.
+    fold=1 picks the second occurrence of a local time that happens twice (DST ending)."""
     m = ISO.match(line)
     if m:
         stamp = m.group(1).replace("Z", "+00:00")
@@ -89,12 +90,13 @@ def parse_line(line, tz, router_now):
         except ValueError:
             return None
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=tz)
+            dt = dt.replace(tzinfo=tz, fold=fold)
         return _split(dt.timestamp(), m.group(3))
     m = LOGREAD.match(line)
     if m and m.group(1) in MONTHS:
         mon, day, hh, mm, ss, year, _, rest = m.groups()
-        dt = datetime.datetime(int(year), MONTHS[mon], int(day), int(hh), int(mm), int(ss), tzinfo=tz)
+        dt = datetime.datetime(int(year), MONTHS[mon], int(day), int(hh), int(mm), int(ss),
+                               tzinfo=tz, fold=fold)
         return _split(dt.timestamp(), rest)
     m = TRAD.match(line)
     if m and m.group(1) in MONTHS:
@@ -102,7 +104,8 @@ def parse_line(line, tz, router_now):
         year = datetime.datetime.fromtimestamp(router_now, tz).year
         for y in (year, year - 1):
             try:
-                dt = datetime.datetime(y, MONTHS[mon], int(day), int(hh), int(mm), int(ss), tzinfo=tz)
+                dt = datetime.datetime(y, MONTHS[mon], int(day), int(hh), int(mm), int(ss),
+                                       tzinfo=tz, fold=fold)
             except ValueError:      # Feb 29 in a non-leap year
                 continue
             if dt.timestamp() <= router_now + 86400:
@@ -214,18 +217,20 @@ class RouterLog:
             raise asyncssh.Error(0, "server sent no host key")
         pinned = key.export_public_key("openssh").decode().strip()
         self.db.set_kv("ssh_host_key", pinned)
-        fp = key.get_fingerprint()
+        fp = _fingerprint(pinned)
         self.db.add_event("pickle", "ssh_host_key",
                           f"Pinned the router's SSH host key on first connect: {fp}")
         log.info("pinned router SSH host key %s", fp)
         return pinned
 
     async def collect(self):
-        self._last_run = time.time()
-        self.status["last_attempt"] = self._last_run
+        self.status["last_attempt"] = time.time()
         if not self._tunnel_ready():
+            # Not counted toward MIN_GAP: the recovery kick that follows once the tunnel is
+            # back must still get through.
             self._set("no_tunnel", "waiting for the WireGuard tunnel")
             return
+        self._last_run = time.time()
         try:
             pinned = self._pinned() or await self._pin()
             self.status["fingerprint"] = _fingerprint(pinned)
@@ -291,6 +296,14 @@ class RouterLog:
             if not parsed:
                 continue
             ts, prog, text = parsed
+            if latest is not None and ts < latest - 300:
+                # When DST ends, an hour of local times happens twice; a line from the second
+                # pass first parses an hour early. Try it as the second occurrence. (The same
+                # local time logged once in each pass, with nothing between, can't be told
+                # apart from the log alone; it's placed in the first pass, not flagged.)
+                again = parse_line(line, tz, router_now, fold=1)
+                if again and again[0] >= latest - 300:
+                    ts, prog, text = again
             kind, data = classify_line(ts, prog, text)
             data.update(prog=prog, text=text[:500])
             # A clock reset (after a power cut, before NTP syncs) shows up as lines that jump
@@ -306,8 +319,10 @@ class RouterLog:
 
 
 def _fingerprint(openssh_key):
+    """Key type and SHA256 fingerprint, e.g. 'ssh-ed25519 SHA256:...'."""
     try:
-        return asyncssh.import_public_key(openssh_key).get_fingerprint()
+        key = asyncssh.import_public_key(openssh_key)
+        return f"{key.get_algorithm()} {key.get_fingerprint()}"
     except (asyncssh.KeyImportError, ValueError):
         return "unreadable pinned key"
 

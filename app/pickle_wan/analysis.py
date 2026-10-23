@@ -170,7 +170,7 @@ def classify(db, checks_by_id, w):
 
     if code in WAN_VERDICTS and lease.get("due"):
         why += " " + lease["note"]
-    if code in WAN_VERDICTS and router_log and router_log.get("finding"):
+    if code in WAN_VERDICTS and router_log and router_log.get("finding") in CALLOUTS:
         why += " " + router_log["note"]
     if set_aside:
         kinds = sorted({"the gateway reboot" if e["kind"] == "reboot" else "the WAN port changes"
@@ -383,6 +383,8 @@ def outage_note(db, start, end):
 
 
 ROUTER_LEAD = 600   # seconds of router log shown before an outage
+# Router log findings worth adding to the verdict's explanation (others are shown, not argued).
+CALLOUTS = {"no_reply", "no_reply_logged", "answered_then_stopped", "quiet"}
 ROUTER_REQUESTS = {"dhcp_renew", "dhcp_rebind", "dhcp_select", "dhcp_discover"}
 ROUTER_ANSWERS = {"dhcp_lease", "dhcp_ack"}
 
@@ -413,19 +415,26 @@ def router_log_context(db, start, end, ongoing, rebooted=False):
     answers = [r for r in lines if r["kind"] in ROUTER_ANSWERS]
     word = {"dhcp_renew": "renewal", "dhcp_rebind": "rebind", "dhcp_select": "request",
             "dhcp_discover": "discover"}
-    unanswered = None
-    for r in requests:
-        nxt = next((a for a in answers if a["ts"] > r["ts"]), None)
-        if r["ts"] >= start - ROUTER_LEAD and (nxt is None or nxt["ts"] >= end - RECOVER_PAD):
-            unanswered = (r, nxt)
-            break
+    def unanswered(lo, hi):
+        """First request sent in [lo, hi) with no answer until the outage was ending."""
+        for r in requests:
+            if lo <= r["ts"] < hi:
+                nxt = next((a for a in answers if a["ts"] > r["ts"]), None)
+                if nxt is None or nxt["ts"] >= end - RECOVER_PAD:
+                    return r, nxt
+        return None
+    # Only a request sent while traffic still flowed says something about the DHCP server:
+    # once the line is dead, nothing gets a reply, whatever the cause.
+    early = unanswered(start - ROUTER_LEAD, start)
+    during = unanswered(start, end + 1)
     before = [a for a in answers if start - ROUTER_LEAD <= a["ts"] < start]
-    if unanswered:
-        r, nxt = unanswered
-        sent = f"His router sent a DHCP {word[r['kind']]} {_relative(r['ts'], start)}"
+    if early:
+        r, nxt = early
+        sent = (f"His router sent a DHCP {word[r['kind']]} {_relative(r['ts'], start)}, while "
+                f"traffic was still flowing")
         if nxt or covered:
             ctx["finding"] = "no_reply"
-            ctx["note"] = (sent + " and got no reply until the outage ended"
+            ctx["note"] = (sent + ", and got no reply until the outage ended"
                            + (f" (answered {_relative(nxt['ts'], start)})" if nxt else "")
                            + ". That points at the ISP's DHCP server.")
         else:
@@ -433,6 +442,12 @@ def router_log_context(db, start, end, ongoing, rebooted=False):
             ctx["note"] = (sent + "; no reply was logged before the outage ended, but the router "
                            "log doesn't clearly cover the whole outage (no later lines yet, or "
                            "a reboot), so a missing reply can't be confirmed.")
+    elif during:
+        r, nxt = during
+        ctx["finding"] = "unanswered_during"
+        ctx["note"] = (f"His router's DHCP {word[r['kind']]} {_relative(r['ts'], start)} went "
+                       f"unanswered, which is expected during an outage whatever the cause"
+                       + ("; service returned when the reply arrived." if nxt else "."))
     elif before:
         a = before[-1]
         ctx["finding"] = "answered_then_stopped"
