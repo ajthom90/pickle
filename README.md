@@ -266,7 +266,7 @@ read-only.
 
 **Host key.** On first connect pickle pins the router's SSH host key and shows its type
 and fingerprint in the gateway panel. Check it from a trusted machine on his LAN, which works
-whatever SSH server the router runs: `ssh-keyscan -t ed25519 <router-ip> | ssh-keygen -lf -`.
+whatever SSH server the router runs: `ssh-keyscan -t rsa <router-ip> | ssh-keygen -lf -` (use the key type the dashboard shows; his Dream Router's is RSA).
 Or compare it with the fingerprint `ssh` shows the first time you log in to the router
 yourself. Make sure the key types match. If the key ever changes, pickle refuses to connect *before* sending the
 password, and shows "host key mismatch". If the router was reset or replaced, put its new

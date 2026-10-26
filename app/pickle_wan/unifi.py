@@ -22,7 +22,9 @@ WAN_WORDS = re.compile(r"wan|internet|isp|uplink", re.I)
 # DHCP lease details aren't documented and vary by firmware, so pickle collects every field
 # whose name looks lease-related (shown raw on the dashboard and in /api/unifi/raw) and only
 # interprets values whose meaning is unambiguous: epoch timestamps and plausible durations.
-LEASE_NAME = re.compile(r"lease|dhcp|expir|obtain|acquir|renew|rebind", re.I)
+LEASE_NAME = re.compile(r"(?<!re)lease|dhcp|expir|obtain|acquir|renew|rebind", re.I)
+# The device record also holds LAN DHCP-server settings, which aren't about his WAN lease.
+LEASE_IGNORE = re.compile(r"range|enabled|servers|rogue|detect|_lan|network_lan", re.I)
 LEASE_OBTAINED = re.compile(r"obtain|acquir|lease_?start|renewed|bound", re.I)
 LEASE_EXPIRES = re.compile(r"expir", re.I)
 LEASE_RELATIVE = re.compile(r"remain|left|_in$|ttl", re.I)
@@ -132,7 +134,8 @@ class UniFi:
                 if dev.get("uptime"):
                     snap["uptime"] = int(dev["uptime"])
                 wan1 = dev.get("wan1") or {}
-                for prefix, obj in (("device", dev), ("wan1", wan1), ("uplink", dev.get("uplink"))):
+                lease_fields.update(_lease_fields(dev, "device", max_depth=0))
+                for prefix, obj in (("wan1", wan1), ("uplink", dev.get("uplink"))):
                     lease_fields.update(_lease_fields(obj, prefix))
                 if _num(wan1.get("uptime")) is not None:
                     snap["wan_uptime"] = int(_num(wan1["uptime"]))
@@ -325,16 +328,17 @@ def _data(body):
     return body if isinstance(body, list) else []
 
 
-def _lease_fields(obj, prefix, depth=0):
+def _lease_fields(obj, prefix, depth=0, max_depth=2):
     """Scalar fields whose name looks lease-related, keyed by their path."""
     out = {}
-    if not isinstance(obj, dict) or depth > 2:
+    if not isinstance(obj, dict) or depth > max_depth:
         return out
     for k, v in obj.items():
         path = f"{prefix}.{k}"
         if isinstance(v, dict):
-            out.update(_lease_fields(v, path, depth + 1))
-        elif LEASE_NAME.search(str(k)) and isinstance(v, (int, float, str, bool)):
+            out.update(_lease_fields(v, path, depth + 1, max_depth))
+        elif (LEASE_NAME.search(str(k)) and not LEASE_IGNORE.search(path)
+              and isinstance(v, (int, float, str, bool))):
             out[path] = v
     return out
 

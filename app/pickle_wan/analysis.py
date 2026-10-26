@@ -150,13 +150,19 @@ def classify(db, checks_by_id, w):
                                                     wan_ip_changed)
     elif failed("wan"):
         code = "last_mile"
-        why = ("His WAN IP stopped answering while the ISP's upstream router stayed reachable"
-               if ok("isp_hop") else "His WAN IP stopped answering")
+        gw_inside = (router_log or {}).get("gateway_down_inside")
+        if gw_inside and ok("isp_hop"):
+            why = (f"His WAN IP stopped answering, and his router couldn't reach the ISP's gateway "
+                   f"({gw_inside[0]}) from inside either, while that gateway kept answering from the "
+                   f"internet")
+        else:
+            why = ("His WAN IP stopped answering while the ISP's upstream router stayed reachable"
+                   if ok("isp_hop") else "His WAN IP stopped answering")
         if set_aside:
             why += ". The fault is between the ISP's gateway and his router: the fiber, the ONT, "
             why += "a WAN port, or his router."
         elif have_unifi:
-            why += ("; UniFi shows the gateway did not reboot. That isolates the link between "
+            why += ("; UniFi shows his router did not reboot. That isolates the link between "
                     "the ISP's gateway and his router: the fiber, the ONT, or a WAN port.")
         else:
             why += (". The fault is between the ISP and his router's WAN port (fiber, ONT, ISP "
@@ -164,6 +170,11 @@ def classify(db, checks_by_id, w):
         note = wan_port_note(port, start, wan_ip_changed)
         if note:
             why += " " + note
+        elif stayed_up and not ongoing and router_cov and not reboots \
+                and router_log and not router_log.get("dhcp_in_window"):
+            why += (" It came back by itself: his router's log shows no link change, no DHCP "
+                    "exchange and no reboot, so it wasn't his DHCP session. Traffic stopped passing "
+                    f"between his router and the ISP's gateway for {_dur(end - start)}, then resumed.")
         elif stayed_up and not ongoing:
             why += (f" {_who(port)} no WAN port change and nothing marked the end (no reconnect or "
                     "lease renewal), so this can't separate the ISP dropping his session from a "
@@ -539,6 +550,8 @@ def router_log_context(db, start, end, ongoing, rebooted=False):
                        "router rebooted).")
 
     ctx["facts"] = _router_facts(lines, start, end)
+    ctx["gateway_down_inside"] = _gateway_down_inside(db, lines, start, end)
+    ctx["dhcp_in_window"] = any(start <= r["ts"] <= end for r in dhcp)
     if ctx["facts"]:
         ctx["note"] = (ctx["note"] + " " if ctx["note"] else "") + " ".join(ctx["facts"])
     return ctx
@@ -599,6 +612,18 @@ def _router_facts(lines, start, end):
         parts = [f"{t} {_relative(ts, start)}" for t, ts in sorted(downs.items(), key=lambda x: x[1])]
         facts.append("His router's own WAN monitors marked these down: " + ", ".join(parts) + ".")
     return facts
+
+
+def _gateway_down_inside(db, lines, start, end):
+    """(ip, ts) if his router's own monitor lost the ISP gateway during the outage. Only his
+    WAN's default gateway counts: that's the address pickle also pings from the internet, so
+    "unreachable from inside, answering from outside" is measured on the same address."""
+    gateways = {(db.get_kv("hops") or {}).get("gateway")} - {None}
+    for r in lines:
+        if r["kind"] == "wan_monitor" and r["data"].get("state") == "down" \
+                and r["data"].get("target") in gateways and start - 60 <= r["ts"] <= end:
+            return r["data"]["target"], r["ts"]
+    return None
 
 
 def recovery_snapshot(db, start, end):
